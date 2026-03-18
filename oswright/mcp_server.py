@@ -11,14 +11,24 @@ Inspired by Playwright MCP's patterns:
 - Compound tools for common multi-step workflows
 
 Run:
-    python -m oswright.mcp_server
-    # or
-    mcp run oswright/mcp_server.py
+    # Standard (stdio transport, used by most MCP clients)
+    uvx oswright
+
+    # Or with Python directly
+    python -m oswright
+
+    # With options
+    python -m oswright --ocr-languages en es --timeout 15
+
+    # SSE transport for remote/multi-client access
+    python -m oswright --port 8931
 """
 
+import argparse
 import io
 import json
 import logging
+import os
 import time
 from typing import Optional
 
@@ -49,6 +59,8 @@ mcp = FastMCP(
 
 _capture = ScreenCapture()
 _ocr: Optional[OCREngine] = None
+_ocr_languages: list[str] = ["en"]
+_default_timeout: float = 10.0
 
 # --- Tool annotation presets (mirrors Playwright MCP pattern) ---
 _READONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=True)
@@ -60,8 +72,8 @@ def _get_ocr() -> OCREngine:
     """Lazy-init OCR engine (heavy first load)."""
     global _ocr
     if _ocr is None:
-        logger.info("Initializing OCR engine (first use)...")
-        _ocr = OCREngine(languages=["en"])
+        logger.info("Initializing OCR engine (first use, languages=%s)...", _ocr_languages)
+        _ocr = OCREngine(languages=_ocr_languages)
     return _ocr
 
 
@@ -871,12 +883,73 @@ def fill_form(
 
 def main():
     """Run the OSWright MCP server."""
+    global _ocr_languages, _default_timeout
+
+    parser = argparse.ArgumentParser(
+        prog="oswright",
+        description="OSWright MCP Server — Playwright-like OS automation for AI agents.",
+    )
+    parser.add_argument(
+        "--port", type=int, default=None,
+        help="Port for SSE transport. If omitted, uses stdio (default for most MCP clients).",
+    )
+    parser.add_argument(
+        "--host", type=str, default="localhost",
+        help="Host to bind SSE server to. Default: localhost. Use 0.0.0.0 for all interfaces.",
+    )
+    parser.add_argument(
+        "--transport", type=str, default=None,
+        choices=["stdio", "sse", "streamable-http"],
+        help="Transport protocol. Auto-detected: stdio if no --port, sse if --port is set.",
+    )
+    parser.add_argument(
+        "--ocr-languages", nargs="+", default=None,
+        help="OCR languages (default: en). Example: --ocr-languages en es fr",
+    )
+    parser.add_argument(
+        "--timeout", type=float, default=None,
+        help="Default timeout in seconds for auto-wait operations (default: 10).",
+    )
+    parser.add_argument(
+        "--log-level", type=str, default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging level (default: INFO).",
+    )
+
+    args = parser.parse_args()
+
+    # Also read from environment variables (env takes precedence if CLI not set)
+    if args.ocr_languages:
+        _ocr_languages = args.ocr_languages
+    elif os.environ.get("OSWRIGHT_OCR_LANGUAGES"):
+        _ocr_languages = os.environ["OSWRIGHT_OCR_LANGUAGES"].split(",")
+
+    if args.timeout is not None:
+        _default_timeout = args.timeout
+    elif os.environ.get("OSWRIGHT_TIMEOUT"):
+        _default_timeout = float(os.environ["OSWRIGHT_TIMEOUT"])
+
+    log_level = os.environ.get("OSWRIGHT_LOG_LEVEL", args.log_level).upper()
     logging.basicConfig(
-        level=logging.INFO,
+        level=getattr(logging, log_level, logging.INFO),
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
-    logger.info("Starting OSWright MCP server")
-    mcp.run()
+
+    # Determine transport
+    transport = args.transport
+    if transport is None:
+        transport = "sse" if args.port else "stdio"
+
+    if args.port:
+        os.environ["FASTMCP_PORT"] = str(args.port)
+        os.environ["FASTMCP_HOST"] = args.host
+
+    logger.info(
+        "Starting OSWright MCP server (transport=%s, ocr=%s, timeout=%.1fs)",
+        transport, _ocr_languages, _default_timeout,
+    )
+
+    mcp.run(transport=transport)
 
 
 if __name__ == "__main__":

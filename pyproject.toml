@@ -8,13 +8,12 @@ version = "0.1.0"
 description = "Playwright-like automation framework for the operating system"
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "MIT"}
+license = "MIT"
 authors = [{name = "OSWright Contributors"}]
 keywords = ["automation", "testing", "os", "desktop", "gui"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: Microsoft :: Windows",
     "Operating System :: POSIX :: Linux",
     "Operating System :: MacOS",
