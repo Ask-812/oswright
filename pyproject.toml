@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "oswright"
+version = "0.1.0"
+description = "Playwright-like automation framework for the operating system"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "OSWright Contributors"}]
+keywords = ["automation", "testing", "os", "desktop", "gui"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Testing",
+    "Topic :: Desktop Environment",
+]
+
+dependencies = [
+    "mss>=9.0",
+    "Pillow>=10.0",
+    "opencv-python>=4.8",
+    "numpy>=1.24",
+    "easyocr>=1.7",
+    "mcp[cli]>=1.0",
+    "pynput>=1.7; sys_platform != 'win32'",
+]
+
+[project.scripts]
+oswright = "oswright.mcp_server:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "ruff>=0.1"]
+
+[tool.setuptools.packages.find]
+include = ["oswright*"]
