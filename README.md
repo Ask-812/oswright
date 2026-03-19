@@ -5,13 +5,16 @@ A Model Context Protocol (MCP) server that provides **OS-level desktop automatio
 ### Key Features
 
 - **Cross-platform.** Windows (Win32 API), Linux (pynput/X11), macOS (pynput/Quartz).
-- **Fast OCR.** Windows OCR (built-in, instant) with EasyOCR fallback for Linux/macOS.
+- **Accessibility tree.** Find elements deterministically by role and name via Windows UI Automation — 100% accurate, instant, no model needed.
+- **Fast OCR.** Windows OCR (built-in, instant) with EasyOCR fallback for Linux/macOS. Results are cached automatically.
 - **Image matching.** Locates elements by template image via OpenCV.
 - **Window management.** List, focus, minimize, close, and screenshot specific windows.
+- **Screenshot diffing.** Detect when the screen changes with `wait_for_change`.
 - **Clipboard access.** Read and write system clipboard for data transfer.
 - **App launcher.** Launch applications and wait for them to load.
 - **Auto-snapshot.** Every action returns a screenshot so the agent always sees current state.
-- **30+ MCP tools.** Screen, OCR, mouse, keyboard, windows, clipboard, and compound actions.
+- **35+ MCP tools.** Screen, OCR, UIA, mouse, keyboard, windows, clipboard, and compound actions.
+- **Test suite.** 22 automated tests covering core functionality.
 
 ### Requirements
 
@@ -344,6 +347,32 @@ Then in your MCP client config:
 
 </details>
 
+<details>
+<summary><b>Accessibility / UI Automation (Windows)</b></summary>
+
+- **get_ui_tree** -- Get the accessibility tree of the focused window. Returns all interactive elements with names, types, positions. Deterministic and instant.
+  - Parameters: `window_title`, `max_depth`
+  - Read-only: **true**
+
+- **click_ui_element** -- Click a UI element using the accessibility tree. More reliable than OCR.
+  - Parameters: `name`, `control_type`, `automation_id`, `window_title`
+
+- **fill_ui_element** -- Set the value of a UI element (e.g., text box). More reliable than OCR-based fill.
+  - Parameters: `value`, `name`, `automation_id`, `window_title`
+
+</details>
+
+<details>
+<summary><b>Advanced Screen</b></summary>
+
+- **get_active_window** -- Get info about the currently focused window.
+  - Read-only: **true**
+
+- **wait_for_change** -- Wait for the screen to visually change. Takes a baseline screenshot, polls until different.
+  - Parameters: `timeout`, `poll_interval`
+
+</details>
+
 ## Python Library
 
 OSWright also works as a standalone Python library with a Playwright-style API:
@@ -370,14 +399,18 @@ oswright/
   screen.py            # Screen class (= Page)
   locator.py           # Locator + Assertions (= Locator + expect)
   capture.py           # Screen capture (mss - cross-platform)
-  detect.py            # OCR dispatcher (auto-selects best backend)
+  detect.py            # OCR dispatcher with caching (auto-selects best backend)
   _ocr_windows.py      # Windows OCR backend (instant, built-in)
+  accessibility.py     # Windows UI Automation (deterministic element finding)
+  cache.py             # Screenshot diffing, image hashing, OCR result cache
   input.py             # Platform dispatcher for input backends
   _input_windows.py    # Windows input backend (Win32 API)
   _input_pynput.py     # Linux/macOS input backend (pynput)
   window.py            # Window management (list, focus, close)
   clipboard.py         # Clipboard read/write (cross-platform)
-  mcp_server.py        # MCP server (30+ tools for AI agents)
+  mcp_server.py        # MCP server (35+ tools for AI agents)
+tests/
+  test_core.py         # 22 automated tests
 ```
 
 ## License

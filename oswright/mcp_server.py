@@ -1134,6 +1134,212 @@ def get_ocr_info() -> str:
     })
 
 
+# =========================================================================
+# ACCESSIBILITY / UI AUTOMATION TOOLS (Windows)
+# =========================================================================
+
+
+@mcp.tool(annotations=_READONLY)
+def get_ui_tree(window_title: Optional[str] = None, max_depth: int = 4) -> str:
+    """
+    Get the accessibility tree of the focused window (or a specific window).
+    Returns all interactive UI elements with their names, types, and positions.
+    This is deterministic and instant — much more reliable than OCR for apps
+    with proper accessibility support (most modern Windows apps).
+
+    Windows only. Falls back gracefully on Linux/macOS.
+
+    Args:
+        window_title: Optional window title to inspect (default: focused window).
+        max_depth: How deep to walk the UI tree (default: 4).
+    """
+    from oswright.accessibility import is_available, find_all_elements
+
+    if not is_available():
+        return json.dumps({
+            "error": "UI Automation not available (Windows only, requires 'uiautomation' package)",
+            "hint": "pip install uiautomation",
+        })
+
+    elements = find_all_elements(window_title=window_title, max_depth=max_depth)
+    results = [el.to_dict() for el in elements]
+
+    return json.dumps({
+        "element_count": len(results),
+        "elements": results,
+        **({"window": window_title} if window_title else {"window": "focused"}),
+    })
+
+
+@mcp.tool(annotations=_INPUT)
+def click_ui_element(
+    name: Optional[str] = None,
+    control_type: Optional[str] = None,
+    automation_id: Optional[str] = None,
+    window_title: Optional[str] = None,
+) -> list:
+    """
+    Click a UI element using the accessibility tree (Windows only).
+    More reliable than OCR — finds elements deterministically by their role and name.
+
+    Args:
+        name: Element name/label (substring match). E.g., "Save", "OK", "File".
+        control_type: Element type: Button, Edit, CheckBox, MenuItem, etc.
+        automation_id: Element automation ID (exact match, if known from get_ui_tree).
+        window_title: Target a specific window.
+    """
+    from oswright.accessibility import is_available, click_element
+
+    if not is_available():
+        return [json.dumps({"error": "UI Automation not available (Windows only)"})]
+
+    el = click_element(
+        name=name, control_type=control_type,
+        automation_id=automation_id, window_title=window_title,
+    )
+    time.sleep(0.3)
+
+    if el:
+        return [
+            json.dumps({
+                "action": "click_ui_element",
+                "clicked": el.to_dict(),
+            }),
+            _take_snapshot_image(),
+        ]
+    return [json.dumps({
+        "action": "click_ui_element",
+        "error": f"Element not found (name={name}, type={control_type})",
+    })]
+
+
+@mcp.tool(annotations=_INPUT)
+def fill_ui_element(
+    value: str,
+    name: Optional[str] = None,
+    automation_id: Optional[str] = None,
+    window_title: Optional[str] = None,
+) -> list:
+    """
+    Set the value of a UI element (e.g., type text into a text box) using
+    the accessibility tree (Windows only). More reliable than OCR-based fill.
+
+    Args:
+        value: Text to enter.
+        name: Element name/label to find.
+        automation_id: Automation ID of the element.
+        window_title: Target a specific window.
+    """
+    from oswright.accessibility import is_available, set_element_value
+
+    if not is_available():
+        return [json.dumps({"error": "UI Automation not available (Windows only)"})]
+
+    success = set_element_value(
+        value=value, name=name,
+        automation_id=automation_id, window_title=window_title,
+    )
+    time.sleep(0.2)
+
+    return [
+        json.dumps({
+            "action": "fill_ui_element",
+            "success": success,
+            "name": name,
+            "value": value,
+        }),
+        _take_snapshot_image(),
+    ]
+
+
+# =========================================================================
+# ADVANCED SCREEN TOOLS
+# =========================================================================
+
+
+@mcp.tool(annotations=_READONLY)
+def get_active_window() -> str:
+    """
+    Get information about the currently active/focused window.
+    Returns the window title, position, size, and process name.
+    """
+    from oswright.window import list_windows as _list_windows
+    import platform
+
+    if platform.system() == "Windows":
+        import ctypes
+        import ctypes.wintypes
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetForegroundWindow()
+        buf = ctypes.create_unicode_buffer(256)
+        user32.GetWindowTextW(hwnd, buf, 256)
+
+        rect = ctypes.wintypes.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(rect))
+
+        pid = ctypes.wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+
+        return json.dumps({
+            "title": buf.value,
+            "handle": hwnd,
+            "left": rect.left,
+            "top": rect.top,
+            "width": rect.right - rect.left,
+            "height": rect.bottom - rect.top,
+            "process_id": pid.value,
+        })
+    else:
+        # Fallback: return first window from list
+        wins = _list_windows()
+        if wins:
+            w = wins[0]
+            return json.dumps({
+                "title": w.title,
+                "left": w.left, "top": w.top,
+                "width": w.width, "height": w.height,
+            })
+        return json.dumps({"error": "No active window found"})
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True))
+def wait_for_change(timeout: float = 10.0, poll_interval: float = 0.5) -> list:
+    """
+    Wait for the screen to visually change. Takes a baseline screenshot,
+    then polls until the screen looks different (or timeout).
+    Useful after triggering an action to wait for the UI to update.
+
+    Args:
+        timeout: Maximum seconds to wait for a change.
+        poll_interval: Seconds between polls.
+    """
+    from oswright.cache import images_differ, get_diff_region
+
+    baseline = _capture.screenshot()
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        time.sleep(poll_interval)
+        current = _capture.screenshot()
+
+        if images_differ(baseline, current):
+            diff = get_diff_region(baseline, current)
+            buf = io.BytesIO()
+            current.save(buf, format="PNG")
+            return [
+                json.dumps({
+                    "changed": True,
+                    "diff_region": diff,
+                }),
+                MCPImage(data=buf.getvalue(), format="png"),
+            ]
+
+    return [json.dumps({
+        "changed": False,
+        "error": f"Screen did not change within {timeout}s",
+    })]
+
+
 def main():
     """Run the OSWright MCP server."""
     global _ocr_languages, _default_timeout

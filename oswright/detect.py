@@ -92,6 +92,10 @@ class OCREngine:
         else:
             raise ValueError(f"Unknown OCR backend: {self._backend}")
 
+        # Initialize OCR result cache
+        from oswright.cache import ScreenCache
+        self._cache = ScreenCache()
+
     @property
     def backend_name(self) -> str:
         """Return the active OCR backend name."""
@@ -114,11 +118,20 @@ class OCREngine:
         return resized, scale
 
     def _read_all_raw(self, image: Image.Image) -> list[ElementMatch]:
-        """Run OCR on image using the active backend. Returns all detected elements."""
+        """Run OCR on image using the active backend. Uses cache if image unchanged."""
+        # Check cache first
+        cached = self._cache.get_cached(image)
+        if cached is not None:
+            return cached
+
         if self._backend == "winocr":
-            return self._read_winocr(image)
+            results = self._read_winocr(image)
         else:
-            return self._read_easyocr(image)
+            results = self._read_easyocr(image)
+
+        # Store in cache
+        self._cache.store(image, results)
+        return results
 
     def _read_winocr(self, image: Image.Image) -> list[ElementMatch]:
         """OCR using Windows.Media.Ocr."""

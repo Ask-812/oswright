@@ -64,6 +64,16 @@ Works with Claude Desktop, VS Code, Cursor, Windsurf, Cline, Goose, and any MCP 
 
 ## Version History
 
+### v0.3.0
+
+- **Accessibility tree support** — Windows UI Automation backend for deterministic element finding by role and name. 100% accurate, instant, no model needed. Tools: `get_ui_tree`, `click_ui_element`, `fill_ui_element`.
+- **OCR result caching** — Perceptual image hashing avoids redundant OCR scans when screen hasn't changed. Automatic cache hits speed up repeated queries.
+- **Screenshot diffing** — `wait_for_change` tool detects when the screen visually changes after an action. `images_differ` and `get_diff_region` utilities.
+- **get_active_window** — New tool to identify which window is currently focused.
+- **Test suite** — 22 automated tests covering cache, diff, clipboard, window management, OCR backend selection.
+- **Security fix** — `launch_app` now rejects shell metacharacters and uses `shell=False`.
+- **35+ MCP tools** total. Improved MCP instructions for better agent guidance.
+
 ### v0.2.0
 
 - **Windows OCR backend** — Built-in Windows.Media.Ocr, instant recognition, zero model download, ~10x faster than EasyOCR. Auto-selected on Windows.
