@@ -1,3 +1,0 @@
-[    1279ms] Uncaught (in promise) Error: reCAPTCHA Timeout (o)
-    at <anonymous> (https://www.gstatic.com/recaptcha/releases/qm3PSRIx10pekcnS9DjGnjPW/recaptcha__en.js:1477:261)
-    at u (https://www.gstatic.com/recaptcha/releases/qm3PSRIx10pekcnS9DjGnjPW/recaptcha__en.js:477:327)

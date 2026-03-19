@@ -1,8 +1,0 @@
-[    1650ms] [ERROR] Failed to load resource: the server responded with a status of 403 () @ https://hackerone.com/users/sign_in:0
-[    3337ms] [ERROR]  Note that 'script-src' was not explicitly set, so 'default-src' is used as a fallback. @ https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile/f/ov2/av0/rch/4qow3/0x4AAAAAAADnPIDROrmt1Wwj/light/fbE/new/normal?lang=auto:0
-[    3743ms] [ERROR] Failed to load resource: the server responded with a status of 401 () @ https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/pat/9dea2acdaac147c5/1773899087419/9eef72db8cb0e08b3588d916018bba3e06a45aafe81c6b8d01421bbe95c5a718/qkpKSXDRWpKN1iF:0
-[    3777ms] [ERROR] %c%d font-size:0;color:transparent NaN @ https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile/f/ov2/av0/rch/4qow3/0x4AAAAAAADnPIDROrmt1Wwj/light/fbE/new/normal?lang=auto:0
-[    3777ms] [ERROR] %c%d font-size:0;color:transparent NaN @ https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile/f/ov2/av0/rch/4qow3/0x4AAAAAAADnPIDROrmt1Wwj/light/fbE/new/normal?lang=auto:0
-[    3781ms] [WARNING] %c%d font-size:0;color:transparent NaN @ https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile/f/ov2/av0/rch/4qow3/0x4AAAAAAADnPIDROrmt1Wwj/light/fbE/new/normal?lang=auto:0
-[    3781ms] [WARNING] %c%d font-size:0;color:transparent NaN @ https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile/f/ov2/av0/rch/4qow3/0x4AAAAAAADnPIDROrmt1Wwj/light/fbE/new/normal?lang=auto:0
-[   16035ms] [WARNING] <meta name="apple-mobile-web-app-capable" content="yes"> is deprecated. Please include <meta name="mobile-web-app-capable" content="yes"> @ https://hackerone.com/my_preferences:0

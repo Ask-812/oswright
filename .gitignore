@@ -33,3 +33,6 @@ htmlcov/
 
 # EasyOCR models (large, downloaded at runtime)
 *.pth
+
+# Playwright MCP artifacts
+.playwright-mcp/
