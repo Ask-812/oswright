@@ -877,8 +877,247 @@ def fill_form(
 
 
 # =========================================================================
-# ENTRY POINT
+# WINDOW MANAGEMENT TOOLS
 # =========================================================================
+
+
+@mcp.tool(annotations=_READONLY)
+def list_windows(title_filter: Optional[str] = None) -> str:
+    """
+    List all visible windows on the desktop. Optionally filter by title substring.
+    Returns window titles, positions, sizes, and process names.
+
+    Args:
+        title_filter: Optional substring to filter window titles (case-insensitive).
+    """
+    from oswright.window import list_windows as _list_windows
+
+    windows = _list_windows(title_filter=title_filter)
+    results = []
+    for w in windows:
+        results.append({
+            "title": w.title,
+            "handle": w.handle,
+            "left": w.left,
+            "top": w.top,
+            "width": w.width,
+            "height": w.height,
+            "process_name": w.process_name,
+            "process_id": w.process_id,
+        })
+
+    return json.dumps({"window_count": len(results), "windows": results})
+
+
+@mcp.tool(annotations=_ACTION)
+def focus_window(title: str) -> list:
+    """
+    Bring a window to the foreground by its title (substring match).
+    Returns the focused window info and a screenshot.
+
+    Args:
+        title: Window title substring to find and focus.
+    """
+    from oswright.window import focus_window as _focus_window
+
+    win = _focus_window(title=title)
+    time.sleep(0.3)
+
+    if win:
+        return [
+            json.dumps({
+                "action": "focus_window",
+                "title": win.title,
+                "handle": win.handle,
+                "position": [win.left, win.top, win.width, win.height],
+            }),
+            _take_snapshot_image(),
+        ]
+    return [json.dumps({"action": "focus_window", "error": f"Window '{title}' not found"})]
+
+
+@mcp.tool(annotations=_ACTION)
+def close_window(title: str) -> list:
+    """
+    Close a window by its title (substring match). Sends WM_CLOSE.
+    Returns action result and a screenshot.
+
+    Args:
+        title: Window title substring to find and close.
+    """
+    from oswright.window import close_window as _close_window
+
+    success = _close_window(title=title)
+    time.sleep(0.5)
+
+    return [
+        json.dumps({
+            "action": "close_window",
+            "title": title,
+            "success": success,
+        }),
+        _take_snapshot_image(),
+    ]
+
+
+@mcp.tool(annotations=_ACTION)
+def minimize_window(title: str) -> list:
+    """
+    Minimize a window by its title (substring match).
+    Returns action result and a screenshot.
+
+    Args:
+        title: Window title substring to find and minimize.
+    """
+    from oswright.window import minimize_window as _minimize_window
+
+    success = _minimize_window(title=title)
+    time.sleep(0.3)
+
+    return [
+        json.dumps({
+            "action": "minimize_window",
+            "title": title,
+            "success": success,
+        }),
+        _take_snapshot_image(),
+    ]
+
+
+@mcp.tool(annotations=_READONLY)
+def screenshot_window(title: str, save_path: Optional[str] = None) -> list:
+    """
+    Take a screenshot of a specific window (by title).
+    Useful for capturing just one application without the rest of the desktop.
+    Returns the image as native MCP image content.
+
+    Args:
+        title: Window title substring to capture.
+        save_path: Optional file path to save the screenshot.
+    """
+    from oswright.window import get_window_region
+
+    region = get_window_region(title=title)
+    if region is None:
+        return [json.dumps({"error": f"Window '{title}' not found"})]
+
+    img = _capture.screenshot(path=save_path, region=region)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+
+    return [
+        json.dumps({
+            "window": title,
+            "width": img.size[0],
+            "height": img.size[1],
+            **({"saved_to": save_path} if save_path else {}),
+        }),
+        MCPImage(data=buf.getvalue(), format="png"),
+    ]
+
+
+# =========================================================================
+# CLIPBOARD TOOLS
+# =========================================================================
+
+
+@mcp.tool(annotations=_READONLY)
+def get_clipboard() -> str:
+    """
+    Get the current text content of the system clipboard.
+    Returns the clipboard text or null if empty.
+    """
+    from oswright.clipboard import get_text
+
+    text = get_text()
+    return json.dumps({"clipboard_text": text})
+
+
+@mcp.tool(annotations=_INPUT)
+def set_clipboard(text: str) -> str:
+    """
+    Set text to the system clipboard. Useful for pasting data into applications.
+
+    Args:
+        text: The text to copy to the clipboard.
+    """
+    from oswright.clipboard import set_text
+
+    success = set_text(text)
+    return json.dumps({"action": "set_clipboard", "success": success, "length": len(text)})
+
+
+# =========================================================================
+# APP LAUNCH TOOL
+# =========================================================================
+
+
+@mcp.tool(annotations=_ACTION)
+def launch_app(command: str, wait_text: Optional[str] = None, timeout: float = 10.0) -> list:
+    """
+    Launch an application by command name. Optionally wait for specific text
+    to appear on screen (indicating the app has loaded).
+    Returns a screenshot after launch.
+
+    Args:
+        command: Application command or path to launch (e.g., 'notepad', 'calc', 'code').
+        wait_text: Optional text to wait for after launch (e.g., the app title).
+        timeout: How long to wait for wait_text to appear (default: 10s).
+    """
+    import subprocess
+    import shlex
+    import platform
+
+    _sys = platform.system()
+
+    # Launch the application
+    if _sys == "Windows":
+        subprocess.Popen(command, shell=True)
+    else:
+        subprocess.Popen(shlex.split(command), start_new_session=True)
+
+    time.sleep(1)  # Give the app a moment to start
+
+    # Optionally wait for text to appear
+    if wait_text:
+        ocr = _get_ocr()
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            img = _capture.screenshot()
+            matches = ocr.find_text(img, wait_text)
+            if matches:
+                break
+            time.sleep(0.5)
+
+    return [
+        json.dumps({
+            "action": "launch_app",
+            "command": command,
+            **({"waited_for": wait_text} if wait_text else {}),
+        }),
+        _take_snapshot_image(),
+    ]
+
+
+# =========================================================================
+# OCR INFO TOOL
+# =========================================================================
+
+
+@mcp.tool(annotations=_READONLY)
+def get_ocr_info() -> str:
+    """
+    Get information about the active OCR backend and available backends.
+    Useful for debugging OCR issues.
+    """
+    from oswright.detect import _OCR_BACKENDS
+
+    ocr = _get_ocr()
+    return json.dumps({
+        "active_backend": ocr.backend_name,
+        "available_backends": _OCR_BACKENDS,
+        "languages": ocr._languages,
+    })
 
 
 def main():

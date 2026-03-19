@@ -5,10 +5,13 @@ A Model Context Protocol (MCP) server that provides **OS-level desktop automatio
 ### Key Features
 
 - **Cross-platform.** Windows (Win32 API), Linux (pynput/X11), macOS (pynput/Quartz).
-- **OCR-powered.** Finds UI elements by their visible text using EasyOCR.
+- **Fast OCR.** Windows OCR (built-in, instant) with EasyOCR fallback for Linux/macOS.
 - **Image matching.** Locates elements by template image via OpenCV.
+- **Window management.** List, focus, minimize, close, and screenshot specific windows.
+- **Clipboard access.** Read and write system clipboard for data transfer.
+- **App launcher.** Launch applications and wait for them to load.
 - **Auto-snapshot.** Every action returns a screenshot so the agent always sees current state.
-- **Compound tools.** High-level actions like `click_text`, `fill_field`, `fill_form` reduce round-trips.
+- **30+ MCP tools.** Screen, OCR, mouse, keyboard, windows, clipboard, and compound actions.
 
 ### Requirements
 
@@ -194,11 +197,11 @@ Then in your MCP client config:
 
 ## Platform Notes
 
-| Platform | Input Backend | Notes |
-|----------|--------------|-------|
-| Windows | Win32 API (SendInput) | No extra dependencies. Works out of the box. |
-| Linux | pynput (X11) | Requires X11 display server. Wayland has limited support. |
-| macOS | pynput (Quartz) | Grant Accessibility permissions in System Settings > Privacy > Accessibility. |
+| Platform | Input Backend | OCR Backend | Notes |
+|----------|--------------|-------------|-------|
+| Windows | Win32 API (SendInput) | Windows OCR (instant) + EasyOCR fallback | No extra deps. Windows OCR is built-in. |
+| Linux | pynput (X11) | EasyOCR | Requires X11 display server. Wayland has limited support. |
+| macOS | pynput (Quartz) | EasyOCR | Grant Accessibility permissions in System Settings > Privacy > Accessibility. |
 
 ## Tools
 
@@ -297,6 +300,50 @@ Then in your MCP client config:
 
 </details>
 
+<details>
+<summary><b>Window Management</b></summary>
+
+- **list_windows** -- List all visible windows. Optionally filter by title substring.
+  - Parameters: `title_filter`
+  - Read-only: **true**
+
+- **focus_window** -- Bring a window to the foreground by title. Returns screenshot.
+  - Parameters: `title`
+
+- **close_window** -- Close a window by title (sends WM_CLOSE). Returns screenshot.
+  - Parameters: `title`
+
+- **minimize_window** -- Minimize a window by title. Returns screenshot.
+  - Parameters: `title`
+
+- **screenshot_window** -- Capture a screenshot of just one window.
+  - Parameters: `title`, `save_path`
+  - Read-only: **true**
+
+</details>
+
+<details>
+<summary><b>Clipboard</b></summary>
+
+- **get_clipboard** -- Get the current text content of the system clipboard.
+  - Read-only: **true**
+
+- **set_clipboard** -- Copy text to the system clipboard.
+  - Parameters: `text`
+
+</details>
+
+<details>
+<summary><b>App Management</b></summary>
+
+- **launch_app** -- Launch an application and optionally wait for it to load.
+  - Parameters: `command`, `wait_text`, `timeout`
+
+- **get_ocr_info** -- Get info about the active OCR backend and available backends.
+  - Read-only: **true**
+
+</details>
+
 ## Python Library
 
 OSWright also works as a standalone Python library with a Playwright-style API:
@@ -323,11 +370,14 @@ oswright/
   screen.py            # Screen class (= Page)
   locator.py           # Locator + Assertions (= Locator + expect)
   capture.py           # Screen capture (mss - cross-platform)
-  detect.py            # OCR + image matching (easyocr, opencv)
+  detect.py            # OCR dispatcher (auto-selects best backend)
+  _ocr_windows.py      # Windows OCR backend (instant, built-in)
   input.py             # Platform dispatcher for input backends
-  _input_windows.py    # Windows backend (Win32 API)
-  _input_pynput.py     # Linux/macOS backend (pynput)
-  mcp_server.py        # MCP server for AI agent integration
+  _input_windows.py    # Windows input backend (Win32 API)
+  _input_pynput.py     # Linux/macOS input backend (pynput)
+  window.py            # Window management (list, focus, close)
+  clipboard.py         # Clipboard read/write (cross-platform)
+  mcp_server.py        # MCP server (30+ tools for AI agents)
 ```
 
 ## License

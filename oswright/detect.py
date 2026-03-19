@@ -5,6 +5,7 @@ Analogous to Playwright's selectors and locators.
 
 import logging
 import os
+import platform
 from dataclasses import dataclass
 from typing import Optional
 
@@ -14,12 +15,27 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
+# --- Detect available OCR backends ---
+_SYSTEM = platform.system()
+_OCR_BACKENDS: list[str] = []
+
+# Prefer Windows OCR (instant, no model download)
+if _SYSTEM == "Windows":
+    try:
+        from oswright import _ocr_windows
+        if _ocr_windows.is_available():
+            _OCR_BACKENDS.append("winocr")
+    except ImportError:
+        pass
+
+# EasyOCR as universal fallback
 try:
     import easyocr
-
-    _OCR_BACKEND = "easyocr"
+    _OCR_BACKENDS.append("easyocr")
 except ImportError:
-    _OCR_BACKEND = None
+    pass
+
+_OCR_BACKEND = _OCR_BACKENDS[0] if _OCR_BACKENDS else None
 
 
 @dataclass
@@ -47,20 +63,39 @@ class ElementMatch:
 
 
 class OCREngine:
-    """OCR-based text detection on screen."""
+    """OCR-based text detection on screen.
+
+    Automatically selects the best available backend:
+    - Windows OCR (winocr): instant, no download, Windows 10+ only
+    - EasyOCR: cross-platform, slower, downloads models on first use
+    """
 
     # Max width for OCR processing (larger images are downsampled to save memory)
     MAX_OCR_WIDTH = 1280
 
-    def __init__(self, languages: list[str] = None):
-        if _OCR_BACKEND is None:
+    def __init__(self, languages: list[str] = None, backend: Optional[str] = None):
+        self._languages = languages or ["en"]
+        self._backend = backend or _OCR_BACKEND
+
+        if self._backend is None:
             raise ImportError(
                 "No OCR backend found. Install easyocr: pip install easyocr"
             )
-        langs = languages or ["en"]
-        logger.info("Loading OCR engine (languages=%s)...", langs)
-        self._reader = easyocr.Reader(langs, gpu=False)
-        logger.info("OCR engine loaded")
+
+        if self._backend == "winocr":
+            logger.info("Using Windows OCR engine (languages=%s)", self._languages)
+            self._reader = None  # Windows OCR needs no preloading
+        elif self._backend == "easyocr":
+            logger.info("Loading EasyOCR engine (languages=%s)...", self._languages)
+            self._reader = easyocr.Reader(self._languages, gpu=False)
+            logger.info("EasyOCR engine loaded")
+        else:
+            raise ValueError(f"Unknown OCR backend: {self._backend}")
+
+    @property
+    def backend_name(self) -> str:
+        """Return the active OCR backend name."""
+        return self._backend
 
     def _preprocess_image(self, image: Image.Image) -> tuple[Image.Image, float]:
         """
@@ -78,6 +113,61 @@ class OCREngine:
         resized = image.resize((new_w, new_h), Image.LANCZOS)
         return resized, scale
 
+    def _read_all_raw(self, image: Image.Image) -> list[ElementMatch]:
+        """Run OCR on image using the active backend. Returns all detected elements."""
+        if self._backend == "winocr":
+            return self._read_winocr(image)
+        else:
+            return self._read_easyocr(image)
+
+    def _read_winocr(self, image: Image.Image) -> list[ElementMatch]:
+        """OCR using Windows.Media.Ocr."""
+        from oswright._ocr_windows import recognize
+
+        # Windows OCR handles its own scaling, but we still preprocess for consistency
+        processed, scale = self._preprocess_image(image)
+        lang = self._languages[0] if self._languages else "en"
+
+        results = recognize(processed, language=lang)
+        elements = []
+        for r in results:
+            left = int(r["left"] / scale)
+            top_coord = int(r["top"] / scale)
+            w = int(r["width"] / scale)
+            h = int(r["height"] / scale)
+            elements.append(ElementMatch(
+                x=left + w // 2,
+                y=top_coord + h // 2,
+                left=left, top=top_coord, width=w, height=h,
+                confidence=0.95,  # Windows OCR doesn't provide confidence
+                text=r["text"],
+                method="ocr-winocr",
+            ))
+        return elements
+
+    def _read_easyocr(self, image: Image.Image) -> list[ElementMatch]:
+        """OCR using EasyOCR."""
+        processed, scale = self._preprocess_image(image)
+        img_array = np.array(processed)
+        results = self._reader.readtext(img_array)
+
+        elements = []
+        for bbox, text, confidence in results:
+            pts = np.array(bbox)
+            left = int(pts[:, 0].min() / scale)
+            top_coord = int(pts[:, 1].min() / scale)
+            right = int(pts[:, 0].max() / scale)
+            bottom = int(pts[:, 1].max() / scale)
+            w = right - left
+            h = bottom - top_coord
+
+            elements.append(ElementMatch(
+                x=left + w // 2, y=top_coord + h // 2,
+                left=left, top=top_coord, width=w, height=h,
+                confidence=confidence, text=text, method="ocr-easyocr",
+            ))
+        return elements
+
     def find_text(
         self, image: Image.Image, target: str, exact: bool = False
     ) -> list[ElementMatch]:
@@ -92,74 +182,27 @@ class OCREngine:
         Returns:
             List of ElementMatch objects sorted by confidence.
         """
-        processed, scale = self._preprocess_image(image)
-        img_array = np.array(processed)
-        results = self._reader.readtext(img_array)
+        all_elements = self._read_all_raw(image)
 
         matches = []
         target_lower = target.lower()
 
-        for bbox, text, confidence in results:
-            text_lower = text.lower()
+        for el in all_elements:
+            text_lower = el.text.lower() if el.text else ""
 
             if exact and text_lower != target_lower:
                 continue
             if not exact and target_lower not in text_lower:
                 continue
 
-            # bbox is [[x1,y1], [x2,y1], [x2,y2], [x1,y2]]
-            pts = np.array(bbox)
-            # Scale coordinates back to original image size
-            left = int(pts[:, 0].min() / scale)
-            top = int(pts[:, 1].min() / scale)
-            right = int(pts[:, 0].max() / scale)
-            bottom = int(pts[:, 1].max() / scale)
-            w = right - left
-            h = bottom - top
-
-            matches.append(
-                ElementMatch(
-                    x=left + w // 2,
-                    y=top + h // 2,
-                    left=left,
-                    top=top,
-                    width=w,
-                    height=h,
-                    confidence=confidence,
-                    text=text,
-                    method="ocr",
-                )
-            )
+            matches.append(el)
 
         matches.sort(key=lambda m: m.confidence, reverse=True)
         return matches
 
     def read_all(self, image: Image.Image) -> list[ElementMatch]:
         """Read all text found in the image."""
-        processed, scale = self._preprocess_image(image)
-        img_array = np.array(processed)
-        results = self._reader.readtext(img_array)
-
-        elements = []
-        for bbox, text, confidence in results:
-            pts = np.array(bbox)
-            # Scale coordinates back to original image size
-            left = int(pts[:, 0].min() / scale)
-            top = int(pts[:, 1].min() / scale)
-            right = int(pts[:, 0].max() / scale)
-            bottom = int(pts[:, 1].max() / scale)
-            w = right - left
-            h = bottom - top
-
-            elements.append(
-                ElementMatch(
-                    x=left + w // 2, y=top + h // 2,
-                    left=left, top=top, width=w, height=h,
-                    confidence=confidence, text=text, method="ocr",
-                )
-            )
-
-        return elements
+        return self._read_all_raw(image)
 
 
 class ImageMatcher:
