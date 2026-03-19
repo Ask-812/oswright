@@ -53,7 +53,12 @@ mcp = FastMCP(
         "or read_screen_text to locate elements via OCR. Then use coordinate-based tools "
         "(mouse_click, type_text) or compound tools (click_text, fill_field) to interact.\n\n"
         "Action tools automatically return a screenshot so you always have current screen state. "
-        "Use wait_for_text to poll for expected UI changes before proceeding."
+        "Use wait_for_text to poll for expected UI changes before proceeding.\n\n"
+        "Window management: Use list_windows to see what's open, focus_window to bring an app "
+        "to front, screenshot_window to capture a specific app, launch_app to start new apps.\n\n"
+        "Clipboard: Use get_clipboard/set_clipboard to transfer data between apps.\n\n"
+        "Tips: Always screenshot first. Use click_text instead of mouse_click when possible. "
+        "After clicking, wait briefly then screenshot to see the result."
     ),
 )
 
@@ -1060,7 +1065,8 @@ def launch_app(command: str, wait_text: Optional[str] = None, timeout: float = 1
     Returns a screenshot after launch.
 
     Args:
-        command: Application command or path to launch (e.g., 'notepad', 'calc', 'code').
+        command: Application name or path to launch (e.g., 'notepad', 'calc', 'code').
+                 Shell operators (|, &, ;, >, <) are not allowed.
         wait_text: Optional text to wait for after launch (e.g., the app title).
         timeout: How long to wait for wait_text to appear (default: 10s).
     """
@@ -1068,11 +1074,19 @@ def launch_app(command: str, wait_text: Optional[str] = None, timeout: float = 1
     import shlex
     import platform
 
+    # Reject shell metacharacters to prevent command injection
+    shell_chars = set('|&;><`$(){}\\\n')
+    if any(c in shell_chars for c in command):
+        return [json.dumps({
+            "action": "launch_app",
+            "error": "Shell metacharacters are not allowed in command. Use a simple app name or path.",
+        })]
+
     _sys = platform.system()
 
-    # Launch the application
     if _sys == "Windows":
-        subprocess.Popen(command, shell=True)
+        # Use shell=False with a simple command split
+        subprocess.Popen(command.split(), shell=False)
     else:
         subprocess.Popen(shlex.split(command), start_new_session=True)
 
