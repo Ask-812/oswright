@@ -1140,7 +1140,7 @@ def get_ocr_info() -> str:
 
 
 @mcp.tool(annotations=_READONLY)
-def get_ui_tree(window_title: Optional[str] = None, max_depth: int = 4) -> str:
+def get_ui_tree(window_title: Optional[str] = None, max_depth: int = 8) -> str:
     """
     Get the accessibility tree of the focused window (or a specific window).
     Returns all interactive UI elements with their names, types, and positions.

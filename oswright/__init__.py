@@ -15,7 +15,7 @@ from oswright.core import OSWright
 from oswright.screen import Screen
 from oswright.locator import Locator, OSWrightError, ElementNotFoundError, TimeoutError
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 __all__ = [
     "OSWright",
     "Screen",

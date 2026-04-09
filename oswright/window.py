@@ -157,11 +157,15 @@ if _SYSTEM == "Windows":
         rect = ctypes.wintypes.RECT()
         user32.GetWindowRect(hwnd, ctypes.byref(rect))
 
+        # Clamp to non-negative (Windows shadow borders can give negative values)
+        left = max(0, rect.left)
+        top = max(0, rect.top)
+
         return {
-            "left": rect.left,
-            "top": rect.top,
-            "width": rect.right - rect.left,
-            "height": rect.bottom - rect.top,
+            "left": left,
+            "top": top,
+            "width": rect.right - left,
+            "height": rect.bottom - top,
         }
 
     def minimize_window(title: Optional[str] = None, handle: Optional[int] = None) -> bool:

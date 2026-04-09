@@ -134,27 +134,31 @@ class OCREngine:
         return results
 
     def _read_winocr(self, image: Image.Image) -> list[ElementMatch]:
-        """OCR using Windows.Media.Ocr."""
+        """OCR using Windows.Media.Ocr. Skips downsampling — Windows OCR is fast enough."""
         from oswright._ocr_windows import recognize
 
-        # Windows OCR handles its own scaling, but we still preprocess for consistency
-        processed, scale = self._preprocess_image(image)
         lang = self._languages[0] if self._languages else "en"
 
-        results = recognize(processed, language=lang)
+        # Windows OCR is fast enough to handle full-resolution images
+        results = recognize(image, language=lang)
         elements = []
         for r in results:
-            left = int(r["left"] / scale)
-            top_coord = int(r["top"] / scale)
-            w = int(r["width"] / scale)
-            h = int(r["height"] / scale)
+            text = r["text"]
+            # Filter single-character noise (taskbar icons, etc.)
+            if len(text) <= 1 and not text.isalnum():
+                continue
+            left = r["left"]
+            top_coord = r["top"]
+            w = r["width"]
+            h = r["height"]
+            level = r.get("level", "word")
             elements.append(ElementMatch(
                 x=left + w // 2,
                 y=top_coord + h // 2,
                 left=left, top=top_coord, width=w, height=h,
-                confidence=0.95,  # Windows OCR doesn't provide confidence
-                text=r["text"],
-                method="ocr-winocr",
+                confidence=0.95,
+                text=text,
+                method=f"ocr-winocr-{level}",
             ))
         return elements
 

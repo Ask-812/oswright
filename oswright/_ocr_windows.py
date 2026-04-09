@@ -80,7 +80,9 @@ async def _recognize_async(image: Image.Image, language: str) -> list[dict]:
 
     elements = []
     for line in result.lines:
-        for word in line.words:
+        words_list = list(line.words)
+        # Add each word
+        for word in words_list:
             rect = word.bounding_rect
             elements.append({
                 "text": word.text,
@@ -88,6 +90,25 @@ async def _recognize_async(image: Image.Image, language: str) -> list[dict]:
                 "top": int(rect.y),
                 "width": int(rect.width),
                 "height": int(rect.height),
+                "level": "word",
+            })
+
+        # Also add the full line text with combined bounding box
+        if line.words:
+            words_list = list(line.words)
+            first_rect = words_list[0].bounding_rect
+            last_rect = words_list[len(words_list) - 1].bounding_rect
+            line_left = int(first_rect.x)
+            line_top = int(min(w.bounding_rect.y for w in words_list))
+            line_right = int(last_rect.x + last_rect.width)
+            line_bottom = int(max(w.bounding_rect.y + w.bounding_rect.height for w in words_list))
+            elements.append({
+                "text": line.text,
+                "left": line_left,
+                "top": line_top,
+                "width": line_right - line_left,
+                "height": line_bottom - line_top,
+                "level": "line",
             })
 
     return elements
