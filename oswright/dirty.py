@@ -211,6 +211,7 @@ class DirtyTracker:
         self._compositor = None
         self._compositor_tried = False
         self.compositor_skips = 0
+        self.compositor_captures = 0
 
     def _get_compositor(self):
         """Lazily create the compositor change source, once."""
@@ -239,6 +240,10 @@ class DirtyTracker:
         Returns True only when the compositor positively confirms it. A False
         result means either something changed or we could not tell, so callers
         must fall back to capturing and hashing.
+
+        When this returns False because something *did* change, the compositor
+        is left holding that frame, so `capture_frame()` can read its pixels
+        without a second, independent grab.
         """
         if self._signature is None:
             return False  # nothing observed yet, so there is no baseline
@@ -255,6 +260,37 @@ class DirtyTracker:
 
         self.compositor_skips += 1
         return True
+
+    def capture_frame(self, expected_size: Optional[tuple[int, int]] = None):
+        """
+        Read pixels from the frame the compositor is already holding.
+
+        Returns a PIL Image, or None if the compositor cannot supply one, in
+        which case the caller should capture normally.
+
+        `expected_size` is a safety check, not an optimisation. Desktop
+        Duplication output 0 is the *primary monitor*, whereas capture backends
+        typically treat index 0 as the whole virtual desktop. On a multi-monitor
+        setup those are different images, and silently substituting one for the
+        other would put every derived coordinate in the wrong place.
+        """
+        source = self._get_compositor()
+        if source is None:
+            return None
+
+        image = source.capture()
+        if image is None:
+            return None
+
+        if expected_size is not None and image.size != expected_size:
+            logger.debug(
+                "Compositor frame is %s but %s was expected; using normal capture",
+                image.size, expected_size,
+            )
+            return None
+
+        self.compositor_captures += 1
+        return image
 
     def reset(self):
         """Forget prior state, so the next frame counts as entirely dirty."""

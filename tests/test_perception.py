@@ -431,6 +431,57 @@ class TestCompositorFastPath:
     def test_close_is_safe_without_a_source(self):
         DirtyTracker(use_compositor=False).close()
 
+    def test_capture_frame_rejects_wrong_size(self):
+        """
+        Desktop Duplication output 0 is the *primary monitor*; capture backends
+        treat index 0 as the whole virtual desktop. On a multi-monitor setup
+        those are different images, and substituting one for the other would
+        put every derived coordinate in the wrong place.
+        """
+        tracker = DirtyTracker()
+
+        class Source:
+            failure_reason = None
+
+            def poll(self, timeout_ms=0):
+                return [(0, 0, 10, 10)]
+
+            def capture(self):
+                return frame((1920, 1080))
+
+            def close(self):
+                pass
+
+        tracker._compositor_tried = True
+        tracker._compositor = Source()
+
+        assert tracker.capture_frame(expected_size=(3840, 1080)) is None
+        assert tracker.capture_frame(expected_size=(1920, 1080)) is not None
+        assert tracker.compositor_captures == 1
+
+    def test_capture_frame_without_source_returns_none(self):
+        tracker = DirtyTracker(use_compositor=False)
+        assert tracker.capture_frame() is None
+
+    def test_capture_frame_tolerates_source_failure(self):
+        tracker = DirtyTracker()
+
+        class Source:
+            failure_reason = "simulated"
+
+            def poll(self, timeout_ms=0):
+                return None
+
+            def capture(self):
+                return None
+
+            def close(self):
+                pass
+
+        tracker._compositor_tried = True
+        tracker._compositor = Source()
+        assert tracker.capture_frame() is None
+
 
 class TestDxgiHelpers:
     def test_hresult_extraction(self):
@@ -455,6 +506,21 @@ class TestDxgiHelpers:
         assert result is None
         assert source.failure_reason
         source.close()
+
+    def test_capture_without_a_held_frame_returns_none(self):
+        """capture() must never invent pixels; it reads a frame poll() acquired."""
+        dxgi = pytest.importorskip("oswright._dxgi_windows")
+        source = dxgi.DxgiDirtySource()
+        assert source.capture() is None  # nothing acquired yet
+        source.close()
+
+    def test_desktop_format_whitelist_is_bgra(self):
+        """The staging copy interprets pixels as BGRX; other formats must be refused."""
+        dxgi = pytest.importorskip("oswright._dxgi_windows")
+        # DXGI_FORMAT_B8G8R8A8_UNORM = 87, _UNORM_SRGB = 91
+        assert 87 in dxgi._SUPPORTED_FORMATS
+        assert 91 in dxgi._SUPPORTED_FORMATS
+        assert 28 not in dxgi._SUPPORTED_FORMATS  # R8G8B8A8, channel order differs
 
 
 class TestCascadeRanking:

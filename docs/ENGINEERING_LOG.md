@@ -297,6 +297,69 @@ analysed, so it cannot disagree with it.
 This trades a further ~7 ms of hashing for a guarantee. That is the right trade
 for a tool whose failure mode is "the agent clicks the wrong thing".
 
+### 2.7 Reading pixels from the frame we already hold
+
+Once §2.5 was in place, screen capture was the largest remaining cost per
+observation. But the compositor path already *acquires a frame* — the pixels
+were sitting on the GPU while a second, independent `mss` grab fetched the same
+image again.
+
+`IDXGIOutputDuplication::MapDesktopSurface` would give direct CPU access with
+almost no code, but it only works when the desktop image lives in system
+memory. Checked on this machine:
+
+```
+DesktopImageInSystemMemory : False
+MapDesktopSurface          : DXGI_ERROR_UNSUPPORTED (0x887A0004)
+```
+
+So the full path is required: `QueryInterface` the acquired resource to
+`ID3D11Texture2D`, create a CPU-readable staging texture, `CopyResource` into
+it on the GPU, `Map` it, and read BGRA rows honouring `RowPitch` (which is
+wider than the image, so the buffer cannot be handed to PIL unmodified).
+
+That means `ID3D11Device::CreateTexture2D` (vtable slot 2) and
+`ID3D11DeviceContext::Map`/`Unmap`/`CopyResource` (slots 7, 8 and **40**, after
+the four `ID3D11DeviceChild` slots). COM dispatches by vtable offset, so every
+preceding method must still occupy its slot — forty-odd placeholders. These are
+generated in a loop rather than hand-written, because one silently misplaced
+entry is memory corruption rather than an error.
+
+**Result: 1.5–2.3× faster than `mss`**, measured across runs (39.8 ms vs
+92.6 ms in one, 54.9 ms vs 83.9 ms in another). Verified correct by diffing
+against an `mss` frame of the same screen: **0.003% of pixels differed**, which
+is live screen change between the two captures.
+
+**A limitation worth stating.** A frame only exists if the compositor actually
+presented one. On a fully idle screen `poll()` reports "nothing changed"
+without acquiring anything, so `capture()` returns None and the caller falls
+back. This is harmless — an unchanged screen does not need re-reading — but it
+means the DXGI capture path helps exactly on the observations that do work, and
+never on the ones that skip.
+
+**A correctness guard.** Desktop Duplication output 0 is the *primary monitor*.
+`mss` monitor 0 is the *entire virtual desktop*. On a multi-monitor setup those
+are different images, and silently substituting one for the other would put
+every derived coordinate in the wrong place. `capture_frame()` therefore takes
+an `expected_size` and refuses to return a frame that does not match.
+
+### 2.8 Why the numbers move so much
+
+Absolute timings in this log vary by up to 3× between runs. Two causes, both
+worth understanding:
+
+- **OCR cost scales with screen *content*.** Full-screen OCR measured 197 ms on
+  a quiet desktop and 592 ms with a dense web page open. The incremental path
+  scales with *change* instead, so the busier the screen, the larger the gap.
+  End-to-end, the same comparison came out at 6.5× on a quiet screen and
+  **14.3×** on a busy one.
+- **Machine load.** One run recorded a UIA tree walk at 3,410 ms while
+  benchmarks were competing for the CPU.
+
+This is why ratios are reported from within a single run rather than mixing
+absolute numbers across runs, and why `benchmarks/` exists: re-measure rather
+than trusting these figures.
+
 ### 2.6 The resolution cascade
 
 Element lookup tries rungs in increasing cost order and stops at the first that
@@ -415,6 +478,10 @@ Approaches investigated and rejected on evidence:
   rung, which is not implemented.
 - *Why is TextPattern below OCR in the cascade if it is exact?* — §2.6.
   Ordering is by "try first", not by quality.
-- *What is the single biggest remaining cost?* — Screen capture, at ~33–48 ms.
-  Reading pixels from the DXGI texture already acquired in §2.5, instead of a
-  second `mss` grab, is the obvious next move.
+- *What is the single biggest remaining cost?* — OCR of the changed regions,
+  now that capture goes through the GPU path. Beyond that, the next structural
+  win is not making perception faster but making it unnecessary: a per-app
+  atlas plus speculative verification (Part 5).
+- *Your numbers vary by 3× between runs — why should I believe them?* — §2.8.
+  Because they are ratios measured within a run, and because `benchmarks/` is
+  in the repository so you can re-measure.

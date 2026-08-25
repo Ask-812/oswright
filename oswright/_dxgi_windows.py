@@ -39,6 +39,13 @@ DXGI_ERROR_ACCESS_LOST = -2005270490         # 0x887A0026, desktop switched
 DXGI_ERROR_INVALID_CALL = -2005270527        # 0x887A0001, frame not released
 DXGI_ERROR_UNSUPPORTED = -2005270524         # 0x887A0004
 
+# D3D11 constants used by the staging-texture capture path.
+D3D11_USAGE_STAGING = 3
+D3D11_CPU_ACCESS_READ = 0x20000
+D3D11_MAP_READ = 1
+# DXGI_FORMAT_B8G8R8A8_UNORM and its sRGB variant: the desktop is BGRA.
+_SUPPORTED_FORMATS = (87, 91)
+
 _available = False
 _import_error: Optional[str] = None
 
@@ -80,6 +87,64 @@ if _available:
             ("PointerShapeBufferSize", ctypes.c_uint),
         ]
 
+    class DXGI_RATIONAL(ctypes.Structure):
+        _fields_ = [("Numerator", ctypes.c_uint), ("Denominator", ctypes.c_uint)]
+
+    class DXGI_MODE_DESC(ctypes.Structure):
+        _fields_ = [
+            ("Width", ctypes.c_uint),
+            ("Height", ctypes.c_uint),
+            ("RefreshRate", DXGI_RATIONAL),
+            ("Format", ctypes.c_uint),
+            ("ScanlineOrdering", ctypes.c_uint),
+            ("Scaling", ctypes.c_uint),
+        ]
+
+    class DXGI_OUTDUPL_DESC(ctypes.Structure):
+        _fields_ = [
+            ("ModeDesc", DXGI_MODE_DESC),
+            ("Rotation", ctypes.c_uint),
+            ("DesktopImageInSystemMemory", ctypes.c_int),
+        ]
+
+    class DXGI_MAPPED_RECT(ctypes.Structure):
+        _fields_ = [("Pitch", ctypes.c_int), ("pBits", ctypes.POINTER(ctypes.c_ubyte))]
+
+    class DXGI_SAMPLE_DESC(ctypes.Structure):
+        _fields_ = [("Count", ctypes.c_uint), ("Quality", ctypes.c_uint)]
+
+    class D3D11_TEXTURE2D_DESC(ctypes.Structure):
+        _fields_ = [
+            ("Width", ctypes.c_uint),
+            ("Height", ctypes.c_uint),
+            ("MipLevels", ctypes.c_uint),
+            ("ArraySize", ctypes.c_uint),
+            ("Format", ctypes.c_uint),
+            ("SampleDesc", DXGI_SAMPLE_DESC),
+            ("Usage", ctypes.c_uint),
+            ("BindFlags", ctypes.c_uint),
+            ("CPUAccessFlags", ctypes.c_uint),
+            ("MiscFlags", ctypes.c_uint),
+        ]
+
+    class D3D11_MAPPED_SUBRESOURCE(ctypes.Structure):
+        _fields_ = [
+            ("pData", ctypes.c_void_p),
+            ("RowPitch", ctypes.c_uint),
+            ("DepthPitch", ctypes.c_uint),
+        ]
+
+    def _reserved(count: int, start: int = 0) -> list:
+        """
+        Placeholder vtable slots.
+
+        Only a handful of D3D11 methods are needed, but COM dispatch is by
+        vtable offset, so every preceding method must still occupy its slot.
+        Generating them beats hand-writing forty-odd entries and getting one
+        of them silently wrong.
+        """
+        return [COMMETHOD([], None, f"_reserved_{start + i}") for i in range(count)]
+
     class DXGI_OUTPUT_DESC(ctypes.Structure):
         _fields_ = [
             ("DeviceName", ctypes.c_wchar * 32),
@@ -117,7 +182,7 @@ if _available:
         _iid_ = GUID("{191cfac3-a341-470d-b26e-a864f428319c}")
         _methods_ = [
             COMMETHOD([], None, "GetDesc",
-                      (["in"], ctypes.c_void_p, "pDesc")),
+                      (["in"], ctypes.POINTER(DXGI_OUTDUPL_DESC), "pDesc")),
             COMMETHOD([], HRESULT, "AcquireNextFrame",
                       (["in"], ctypes.c_uint, "TimeoutInMilliseconds"),
                       (["out"], ctypes.POINTER(DXGI_OUTDUPL_FRAME_INFO), "pFrameInfo"),
@@ -136,7 +201,7 @@ if _available:
                       (["in"], ctypes.POINTER(ctypes.c_uint), "pPointerShapeBufferSizeRequired"),
                       (["in"], ctypes.c_void_p, "pPointerShapeInfo")),
             COMMETHOD([], HRESULT, "MapDesktopSurface",
-                      (["in"], ctypes.c_void_p, "pLockedRect")),
+                      (["in"], ctypes.POINTER(DXGI_MAPPED_RECT), "pLockedRect")),
             COMMETHOD([], HRESULT, "UnMapDesktopSurface"),
             COMMETHOD([], HRESULT, "ReleaseFrame"),
         ]
@@ -193,6 +258,52 @@ if _available:
             COMMETHOD([], HRESULT, "GetGPUThreadPriority",
                       (["out"], ctypes.POINTER(ctypes.c_int), "pPriority")),
         ]
+
+    # --- D3D11, needed only to copy the desktop texture somewhere readable ---
+
+    class ID3D11Texture2D(IUnknown):
+        # ID3D11DeviceChild (4) + ID3D11Resource (4) precede GetDesc.
+        _iid_ = GUID("{6f15aaf2-d208-4e89-9ab4-489535d34f9c}")
+        _methods_ = _reserved(8) + [
+            COMMETHOD([], None, "GetDesc",
+                      (["in"], ctypes.POINTER(D3D11_TEXTURE2D_DESC), "pDesc")),
+        ]
+
+    class ID3D11Device(IUnknown):
+        _iid_ = GUID("{db6f6ddb-ac77-4e88-8253-819df9bbf140}")
+        _methods_ = _reserved(2) + [  # CreateBuffer, CreateTexture1D
+            COMMETHOD([], HRESULT, "CreateTexture2D",
+                      (["in"], ctypes.POINTER(D3D11_TEXTURE2D_DESC), "pDesc"),
+                      (["in"], ctypes.c_void_p, "pInitialData"),
+                      (["out"], ctypes.POINTER(ctypes.POINTER(ID3D11Texture2D)),
+                       "ppTexture2D")),
+        ]
+
+    class ID3D11DeviceContext(IUnknown):
+        # ID3D11DeviceChild occupies the first 4 slots. Within the context's own
+        # vtable Map is 7, Unmap is 8 and CopyResource is 40.
+        _iid_ = GUID("{c0bfa96c-e089-44fb-8eaf-26f8796190da}")
+        _methods_ = (
+            _reserved(4 + 7)
+            + [
+                COMMETHOD([], HRESULT, "Map",
+                          (["in"], ctypes.POINTER(IUnknown), "pResource"),
+                          (["in"], ctypes.c_uint, "Subresource"),
+                          (["in"], ctypes.c_uint, "MapType"),
+                          (["in"], ctypes.c_uint, "MapFlags"),
+                          (["in"], ctypes.POINTER(D3D11_MAPPED_SUBRESOURCE),
+                           "pMappedResource")),
+                COMMETHOD([], None, "Unmap",
+                          (["in"], ctypes.POINTER(IUnknown), "pResource"),
+                          (["in"], ctypes.c_uint, "Subresource")),
+            ]
+            + _reserved(31, start=100)  # slots 9..39
+            + [
+                COMMETHOD([], None, "CopyResource",
+                          (["in"], ctypes.POINTER(IUnknown), "pDstResource"),
+                          (["in"], ctypes.POINTER(IUnknown), "pSrcResource")),
+            ]
+        )
 
     # Without explicit argtypes ctypes assumes C ints and truncates every
     # pointer on 64-bit, which shows up as an access violation rather than an
@@ -256,10 +367,16 @@ class DxgiDirtySource:
         self._output_index = output_index
         self._dup = None
         self._device = None
+        self._d3d_device = None
+        self._context = None
+        self._staging = None
+        self._staging_size = None
+        self._last_resource = None
         self._desktop_origin = (0, 0)
         self._holding_frame = False
         self._failed = False
         self._failure_reason: Optional[str] = None
+        self._capture_failed = False
 
     # --- lifecycle ---
 
@@ -311,6 +428,8 @@ class DxgiDirtySource:
             raise OSError("D3D11CreateDevice returned a null device")
 
         self._device = device
+        self._d3d_device = device.QueryInterface(ID3D11Device)
+        self._context = context.QueryInterface(ID3D11DeviceContext) if context else None
 
         # COM interfaces are unrelated C++ types; moving between them requires
         # QueryInterface, not a pointer cast.
@@ -335,12 +454,101 @@ class DxgiDirtySource:
             except Exception:
                 pass
         self._holding_frame = False
+        self._last_resource = None
 
     def close(self):
         """Release the duplication object."""
         self._release_frame()
         self._dup = None
         self._device = None
+        self._d3d_device = None
+        self._context = None
+        self._staging = None
+        self._staging_size = None
+
+    def capture(self):
+        """
+        Read the desktop image from the frame this source is already holding.
+
+        Returns a PIL Image, or None when unavailable -- no frame is held, the
+        GPU path is unsupported, or anything failed. Callers fall back to a
+        normal screen capture.
+
+        The frame was already acquired by `poll()`, so this avoids a second,
+        independent grab of the same pixels through a different API.
+
+        Note that a frame only exists if the compositor actually presented one.
+        On a completely idle screen `poll()` returns "nothing changed" without
+        acquiring anything, and this returns None -- which is harmless, because
+        an unchanged screen does not need to be re-read.
+        """
+        if self._capture_failed or not self._holding_frame or self._last_resource is None:
+            return None
+        if self._context is None or self._d3d_device is None:
+            return None
+
+        try:
+            return self._capture_via_staging()
+        except Exception as e:  # pragma: no cover - driver dependent
+            logger.info(
+                "DXGI capture unavailable (%s: %s); using the normal capture path",
+                type(e).__name__, e,
+            )
+            self._capture_failed = True
+            return None
+
+    def _ensure_staging(self, width: int, height: int, fmt: int):
+        """A CPU-readable texture to copy the desktop into, created once."""
+        if self._staging is not None and self._staging_size == (width, height, fmt):
+            return self._staging
+
+        desc = D3D11_TEXTURE2D_DESC()
+        desc.Width = width
+        desc.Height = height
+        desc.MipLevels = 1
+        desc.ArraySize = 1
+        desc.Format = fmt
+        desc.SampleDesc.Count = 1
+        desc.SampleDesc.Quality = 0
+        desc.Usage = D3D11_USAGE_STAGING
+        desc.BindFlags = 0
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ
+        desc.MiscFlags = 0
+
+        self._staging = self._d3d_device.CreateTexture2D(ctypes.byref(desc), None)
+        self._staging_size = (width, height, fmt)
+        return self._staging
+
+    def _capture_via_staging(self):
+        from PIL import Image
+
+        desktop = self._last_resource.QueryInterface(ID3D11Texture2D)
+        desc = D3D11_TEXTURE2D_DESC()
+        desktop.GetDesc(ctypes.byref(desc))
+
+        if desc.Format not in _SUPPORTED_FORMATS:
+            raise ValueError(f"unsupported desktop format {desc.Format}")
+
+        staging = self._ensure_staging(desc.Width, desc.Height, desc.Format)
+
+        # GPU-side copy into memory the CPU is allowed to read.
+        self._context.CopyResource(staging, desktop)
+
+        mapped = D3D11_MAPPED_SUBRESOURCE()
+        self._context.Map(staging, 0, D3D11_MAP_READ, 0, ctypes.byref(mapped))
+        try:
+            # Rows are padded to RowPitch, which is usually wider than the
+            # image, so the buffer cannot be handed to PIL as-is.
+            size = mapped.RowPitch * desc.Height
+            raw = ctypes.string_at(mapped.pData, size)
+            image = Image.frombuffer(
+                "RGB", (desc.Width, desc.Height), raw, "raw", "BGRX", mapped.RowPitch, 1
+            )
+            # frombuffer keeps a reference to `raw`; copy so the image outlives
+            # the mapping.
+            return image.copy()
+        finally:
+            self._context.Unmap(staging, 0)
 
     def __enter__(self):
         return self
@@ -369,7 +577,7 @@ class DxgiDirtySource:
         self._release_frame()
 
         try:
-            info, _resource = self._dup.AcquireNextFrame(timeout_ms)
+            info, resource = self._dup.AcquireNextFrame(timeout_ms)
         except _COM_ERRORS as e:
             code = _hresult_of(e)
             if code == DXGI_ERROR_WAIT_TIMEOUT:
@@ -385,6 +593,7 @@ class DxgiDirtySource:
             return self._fail(f"AcquireNextFrame: {type(e).__name__}: {e}")
 
         self._holding_frame = True
+        self._last_resource = resource
 
         # A frame with no metadata is a cursor-only update: the desktop image is
         # unchanged, so there is nothing to re-read.
