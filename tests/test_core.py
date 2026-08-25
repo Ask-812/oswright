@@ -5,7 +5,6 @@ Run with: python -m pytest tests/ -v
 
 import pytest
 from PIL import Image
-import numpy as np
 
 
 class TestElementMatch:
@@ -133,8 +132,9 @@ class TestClipboard:
     """Tests for clipboard operations (platform-specific)."""
 
     def test_set_and_get(self):
-        from oswright.clipboard import get_text, set_text
         import platform
+
+        from oswright.clipboard import get_text, set_text
         if platform.system() != "Windows":
             pytest.skip("Clipboard test requires Windows")
 
@@ -142,12 +142,282 @@ class TestClipboard:
         assert set_text(test_str)
         assert get_text() == test_str
 
+    def test_unicode_roundtrip(self):
+        """Astral-plane characters must survive, not get truncated."""
+        import platform
+
+        from oswright.clipboard import get_text, set_text
+        if platform.system() != "Windows":
+            pytest.skip("Clipboard test requires Windows")
+
+        test_str = "caf\u00e9 \u65e5\u672c\u8a9e \U0001f680"
+        assert set_text(test_str)
+        assert get_text() == test_str
+
+    def test_empty_string_roundtrip(self):
+        import platform
+
+        from oswright.clipboard import get_text, set_text
+        if platform.system() != "Windows":
+            pytest.skip("Clipboard test requires Windows")
+
+        assert set_text("")
+        assert get_text() == ""
+
+
+class TestExactHash:
+    """The OCR cache must never serve results for a different image."""
+
+    def test_same_image_same_hash(self):
+        from oswright.cache import exact_hash
+        img = Image.new("RGB", (64, 64), "red")
+        assert exact_hash(img) == exact_hash(img.copy())
+
+    def test_single_pixel_change_changes_hash(self):
+        from oswright.cache import exact_hash
+        img1 = Image.new("RGB", (64, 64), "white")
+        img2 = img1.copy()
+        img2.putpixel((10, 10), (0, 0, 0))
+        assert exact_hash(img1) != exact_hash(img2)
+
+    def test_different_sizes_never_collide(self):
+        from oswright.cache import exact_hash
+        assert exact_hash(Image.new("RGB", (100, 100), "white")) != exact_hash(
+            Image.new("RGB", (200, 200), "white")
+        )
+
+    def test_different_mode_changes_hash(self):
+        from oswright.cache import exact_hash
+        img = Image.new("RGB", (32, 32), "white")
+        assert exact_hash(img) != exact_hash(img.convert("L"))
+
+
+class TestColorDiff:
+    """Screen diffing must notice colour-only changes."""
+
+    def test_equal_luminance_colors_differ(self):
+        from oswright.cache import images_differ
+        red = Image.new("RGB", (50, 50), (255, 0, 0))
+        # Chosen so grayscale luminance is close but the hue is obviously different.
+        green = Image.new("RGB", (50, 50), (0, 180, 0))
+        assert images_differ(red, green)
+
+    def test_diff_region_finds_color_only_change(self):
+        from oswright.cache import get_diff_region
+        img1 = Image.new("RGB", (60, 60), (255, 0, 0))
+        img2 = img1.copy()
+        for x in range(10, 20):
+            for y in range(15, 25):
+                img2.putpixel((x, y), (0, 180, 0))
+        region = get_diff_region(img1, img2)
+        assert region == {"left": 10, "top": 15, "width": 10, "height": 10}
+
+
+class TestImageMatcher:
+    """Template matching correctness."""
+
+    @staticmethod
+    def _scene():
+        from PIL import ImageDraw
+        img = Image.new("RGB", (300, 200), "white")
+        ImageDraw.Draw(img).rectangle([80, 60, 120, 90], fill=(30, 90, 200))
+        return img
+
+    def test_finds_single_occurrence(self):
+        from oswright.detect import ImageMatcher
+        scene = self._scene()
+        template = scene.crop((80, 60, 121, 91))
+        matches = ImageMatcher.find_image_from_array(scene, template)
+        assert len(matches) == 1
+        assert abs(matches[0].x - 100) <= 2
+        assert abs(matches[0].y - 75) <= 2
+
+    def test_coordinates_are_json_serializable(self):
+        """np.int64 coordinates would raise TypeError in json.dumps."""
+        import json
+
+        from oswright.detect import ImageMatcher
+        scene = self._scene()
+        matches = ImageMatcher.find_image_from_array(scene, scene.crop((80, 60, 121, 91)))
+        for m in matches:
+            assert type(m.x) is int and type(m.y) is int
+            assert type(m.width) is int and type(m.height) is int
+            assert type(m.confidence) is float
+            json.dumps({"x": m.x, "y": m.y, "w": m.width, "c": m.confidence})
+
+    def test_oversized_template_is_rejected(self):
+        from oswright.detect import ImageMatcher
+        with pytest.raises(ValueError, match="larger than"):
+            ImageMatcher.find_image_from_array(
+                self._scene(), Image.new("RGB", (500, 500), "white")
+            )
+
+    def test_missing_template_file_raises(self):
+        from oswright.detect import ImageMatcher
+        with pytest.raises(FileNotFoundError):
+            ImageMatcher.find_image(self._scene(), "no_such_template_file.png")
+
+
+class TestElementMatchOffset:
+    """Offsetting must never mutate a match shared via the OCR cache."""
+
+    def test_offset_returns_new_object(self):
+        from oswright.detect import ElementMatch
+        m = ElementMatch(x=10, y=20, left=5, top=15, width=10, height=10, confidence=0.9)
+        moved = m.offset(100, 200)
+        assert (m.x, m.y, m.left, m.top) == (10, 20, 5, 15), "original was mutated"
+        assert (moved.x, moved.y, moved.left, moved.top) == (110, 220, 105, 215)
+
+    def test_zero_offset_is_identity(self):
+        from oswright.detect import ElementMatch
+        m = ElementMatch(x=1, y=2, left=3, top=4, width=5, height=6, confidence=0.5)
+        assert m.offset(0, 0) is m
+
+    def test_repeated_offset_does_not_accumulate(self):
+        """Applying an offset twice to the same cached match must be safe."""
+        from oswright.detect import ElementMatch
+        m = ElementMatch(x=10, y=10, left=10, top=10, width=4, height=4, confidence=1.0)
+        assert m.offset(5, 5).x == 15
+        assert m.offset(5, 5).x == 15
+
+
+class TestRegionValidation:
+    """Partial regions used to be ignored, silently capturing the whole screen."""
+
+    def test_all_four_bounds_makes_region(self):
+        from oswright.mcp_server import _region_of
+        assert _region_of(1, 2, 3, 4) == {"left": 1, "top": 2, "width": 3, "height": 4}
+
+    def test_no_bounds_means_no_region(self):
+        from oswright.mcp_server import _region_of
+        assert _region_of(None, None, None, None) is None
+
+    @pytest.mark.parametrize("bounds", [
+        (0, None, None, None),
+        (0, 0, None, None),
+        (0, 0, 10, None),
+    ])
+    def test_partial_bounds_rejected(self, bounds):
+        from oswright.mcp_server import _region_of
+        with pytest.raises(ValueError):
+            _region_of(*bounds)
+
+    def test_non_positive_size_rejected(self):
+        from oswright.mcp_server import _region_of
+        with pytest.raises(ValueError):
+            _region_of(0, 0, 0, 10)
+
+
+class TestCommandSplitting:
+    """launch_app must accept real Windows paths."""
+
+    def test_windows_path_survives(self):
+        import platform
+        if platform.system() != "Windows":
+            pytest.skip("Windows path splitting")
+        from oswright.mcp_server import _split_command
+        assert _split_command(r"C:\Windows\System32\notepad.exe") == [
+            r"C:\Windows\System32\notepad.exe"
+        ]
+
+    def test_quoted_path_with_spaces(self):
+        import platform
+        if platform.system() != "Windows":
+            pytest.skip("Windows path splitting")
+        from oswright.mcp_server import _split_command
+        assert _split_command(r'"C:\Program Files\App\a.exe" file.txt') == [
+            r"C:\Program Files\App\a.exe", "file.txt",
+        ]
+
+    def test_bare_name_and_args(self):
+        from oswright.mcp_server import _split_command
+        assert _split_command("code --new-window") == ["code", "--new-window"]
+
+
+class TestLoopbackDetection:
+    """Binding remotely without auth must require an explicit opt-in."""
+
+    @pytest.mark.parametrize("host", ["localhost", "127.0.0.1", "::1", "127.0.0.5"])
+    def test_loopback_hosts(self, host):
+        from oswright.mcp_server import _is_loopback
+        assert _is_loopback(host)
+
+    @pytest.mark.parametrize("host", ["0.0.0.0", "192.168.1.10", "example.com", "::"])
+    def test_remote_hosts(self, host):
+        from oswright.mcp_server import _is_loopback
+        assert not _is_loopback(host)
+
+
+class TestTimeoutResolution:
+    """--timeout was previously never read by any tool."""
+
+    def test_none_uses_server_default(self):
+        import oswright.mcp_server as server
+        original = server._default_timeout
+        server._default_timeout = 42.0
+        try:
+            assert server._timeout(None) == 42.0
+            assert server._timeout(3.0) == 3.0
+        finally:
+            server._default_timeout = original
+
+
+class TestLocator:
+    """Locator construction and selection logic (no screen access)."""
+
+    @staticmethod
+    def _locator(**kwargs):
+        from oswright.locator import Locator
+        return Locator(capture=None, text="x", **kwargs)
+
+    def test_requires_search_criteria(self):
+        from oswright.locator import Locator, OSWrightError
+        with pytest.raises(OSWrightError):
+            Locator(capture=None)
+
+    def test_select_first_and_last(self):
+        from oswright.detect import ElementMatch
+        items = [
+            ElementMatch(x=i, y=0, left=0, top=0, width=1, height=1, confidence=1.0)
+            for i in range(3)
+        ]
+        assert self._locator(nth=0)._select(items).x == 0
+        assert self._locator(nth=-1)._select(items).x == 2
+        assert self._locator(nth=1)._select(items).x == 1
+
+    def test_select_out_of_range(self):
+        from oswright.detect import ElementMatch
+        items = [ElementMatch(x=0, y=0, left=0, top=0, width=1, height=1, confidence=1.0)]
+        assert self._locator(nth=5)._select(items) is None
+        assert self._locator(nth=0)._select([]) is None
+
+    def test_image_locator_needs_no_ocr(self):
+        """Template matching must work with no OCR backend configured."""
+        from oswright.locator import Locator
+        loc = Locator(capture=None, image="icon.png")
+        assert loc._describe() == 'image="icon.png"'
+
+    def test_assertions_inherit_locator_timeout(self):
+        loc = self._locator(timeout=33.0)
+        assert loc.expect()._timeout == 33.0
+
+    def test_assertion_explicit_zero_timeout_respected(self):
+        loc = self._locator(timeout=33.0)
+        assert loc.expect()._resolve_timeout(0) == 0
+
+
+class TestDPIAwareness:
+    def test_idempotent(self):
+        from oswright._dpi import ensure_dpi_aware
+        first = ensure_dpi_aware()
+        assert ensure_dpi_aware() == first
+
 
 class TestOCREngine:
     """Tests for OCR engine initialization."""
 
     def test_backend_selection(self):
-        from oswright.detect import _OCR_BACKENDS, _OCR_BACKEND
+        from oswright.detect import _OCR_BACKEND, _OCR_BACKENDS
         assert len(_OCR_BACKENDS) > 0
         assert _OCR_BACKEND is not None
         assert _OCR_BACKEND in _OCR_BACKENDS
@@ -156,6 +426,15 @@ class TestOCREngine:
         from oswright.detect import OCREngine
         engine = OCREngine()
         assert engine.backend_name in ("winocr", "easyocr")
+
+    def test_easyocr_not_imported_at_module_scope(self):
+        """Importing easyocr pulls in torch and costs seconds of startup."""
+        import importlib
+        import sys
+
+        import oswright.detect
+        importlib.reload(oswright.detect)
+        assert "easyocr" not in sys.modules or "torch" in sys.modules
 
 
 class TestWindowManagement:
@@ -192,8 +471,7 @@ class TestVersion:
         assert all(p.isdigit() for p in parts)
 
     def test_exports(self):
-        from oswright import OSWright, Screen, Locator
-        from oswright import OSWrightError, TimeoutError, ElementNotFoundError
+        from oswright import Locator, OSWright, Screen
         assert OSWright is not None
         assert Screen is not None
         assert Locator is not None

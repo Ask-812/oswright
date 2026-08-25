@@ -7,14 +7,16 @@ A Model Context Protocol (MCP) server that provides **OS-level desktop automatio
 - **Cross-platform.** Windows (Win32 API), Linux (pynput/X11), macOS (pynput/Quartz).
 - **Accessibility tree.** Find elements deterministically by role and name via Windows UI Automation — 100% accurate, instant, no model needed.
 - **Fast OCR.** Windows OCR (built-in, instant) with EasyOCR fallback for Linux/macOS. Results are cached automatically.
+- **Lightweight on Windows.** No PyTorch download — Windows uses the built-in OCR engine, so a full install is a few MB rather than a few GB.
 - **Image matching.** Locates elements by template image via OpenCV.
 - **Window management.** List, focus, minimize, close, and screenshot specific windows.
 - **Screenshot diffing.** Detect when the screen changes with `wait_for_change`.
 - **Clipboard access.** Read and write system clipboard for data transfer.
 - **App launcher.** Launch applications and wait for them to load.
 - **Auto-snapshot.** Every action returns a screenshot so the agent always sees current state.
-- **35+ MCP tools.** Screen, OCR, UIA, mouse, keyboard, windows, clipboard, and compound actions.
-- **Test suite.** 22 automated tests covering core functionality.
+- **36 MCP tools.** Screen, OCR, UIA, mouse, keyboard, windows, clipboard, and compound actions.
+- **DPI-correct.** Coordinates are physical pixels everywhere, so clicks land correctly on scaled displays.
+- **Test suite.** 91 automated tests; the desktop-driving ones skip themselves when no display is available.
 
 ### Requirements
 
@@ -159,11 +161,15 @@ OSWright MCP server supports the following arguments. They can be provided in th
 | Option | Description | Env Variable |
 |--------|-------------|-------------|
 | `--port <port>` | Port for SSE transport. If omitted, uses stdio (default). | `FASTMCP_PORT` |
-| `--host <host>` | Host to bind SSE server to. Default: `localhost`. | `FASTMCP_HOST` |
+| `--host <host>` | Host to bind the HTTP/SSE server to. Default: `127.0.0.1`. | `FASTMCP_HOST` |
 | `--transport <mode>` | Transport protocol: `stdio`, `sse`, `streamable-http`. Auto-detected from `--port`. | |
 | `--ocr-languages <langs>` | OCR languages (default: `en`). Example: `--ocr-languages en es fr` | `OSWRIGHT_OCR_LANGUAGES` |
 | `--timeout <seconds>` | Default timeout for auto-wait operations (default: `10`). | `OSWRIGHT_TIMEOUT` |
+| `--snapshot-max-width <px>` | Downscale the auto-snapshot returned after each action. `0` (default) keeps full resolution. Lower values cut token cost significantly. | `OSWRIGHT_SNAPSHOT_MAX_WIDTH` |
+| `--allow-remote` | Required to bind a non-loopback address. See [Security](#security). | |
 | `--log-level <level>` | Logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR`. Default: `INFO`. | `OSWRIGHT_LOG_LEVEL` |
+
+An explicit command-line flag always wins over the corresponding environment variable.
 
 ### Example: Multi-language OCR
 
@@ -180,7 +186,7 @@ OSWright MCP server supports the following arguments. They can be provided in th
 
 ### Standalone MCP server (SSE)
 
-When running from a remote machine or a worker process, use SSE transport:
+When running from a worker process or another machine, use SSE transport:
 
 ```bash
 uvx oswright --port 8931
@@ -192,19 +198,57 @@ Then in your MCP client config:
 {
   "mcpServers": {
     "oswright": {
-      "url": "http://localhost:8931/mcp"
+      "url": "http://127.0.0.1:8931/sse"
     }
   }
 }
 ```
 
+## Security
+
+**OSWright has no authentication.** Anyone who can reach the port gets full
+keyboard, mouse, screen and clipboard control of the machine — it is remote
+desktop takeover, not a sandboxed API.
+
+The server therefore binds to `127.0.0.1` by default and **refuses** to start on
+a non-loopback address unless you pass `--allow-remote`. To reach it from
+another machine, prefer an SSH tunnel over exposing the port:
+
+```bash
+ssh -L 8931:127.0.0.1:8931 user@desktop-host
+```
+
+Stdio transport (the default, used by every MCP client config above) is not
+network-exposed at all and is the recommended way to run OSWright.
+
+Tools that can destroy work are annotated accordingly: `close_window` is marked
+destructive, and `launch_app` starts arbitrary programs. Screenshot tools refuse
+to overwrite an existing `save_path`.
+
 ## Platform Notes
 
-| Platform | Input Backend | OCR Backend | Notes |
+| Platform | Input Backend | OCR Backend | Extra downloads |
 |----------|--------------|-------------|-------|
-| Windows | Win32 API (SendInput) | Windows OCR (instant) + EasyOCR fallback | No extra deps. Windows OCR is built-in. |
-| Linux | pynput (X11) | EasyOCR | Requires X11 display server. Wayland has limited support. |
-| macOS | pynput (Quartz) | EasyOCR | Grant Accessibility permissions in System Settings > Privacy > Accessibility. |
+| Windows | Win32 API (SendInput) | Windows OCR (instant, built-in) | **None.** No PyTorch. UI Automation included. |
+| Linux | pynput (X11) | EasyOCR | PyTorch (~2.5 GB). Requires X11; Wayland has limited support. |
+| macOS | pynput (Quartz) | EasyOCR | PyTorch (~2.5 GB). Grant Accessibility permissions in System Settings > Privacy > Accessibility. |
+
+On Windows, EasyOCR is *not* installed, because the built-in Windows OCR engine
+is faster and needs no model download. Install it only if you need a language
+Windows OCR does not support:
+
+```bash
+pip install "oswright[easyocr]"
+```
+
+### Coordinates
+
+All coordinates returned by OCR, image matching and UI Automation are **absolute
+physical screen pixels**, ready to pass straight to `mouse_click`. This holds for
+sub-regions and for multi-monitor setups where the virtual desktop starts at a
+negative origin. `screenshot` also reports `origin_x`/`origin_y`, the absolute
+position of the image's top-left pixel, for when you read a coordinate off the
+image yourself.
 
 ## Tools
 
@@ -339,8 +383,9 @@ Then in your MCP client config:
 <details>
 <summary><b>App Management</b></summary>
 
-- **launch_app** -- Launch an application and optionally wait for it to load.
-  - Parameters: `command`, `wait_text`, `timeout`
+- **launch_app** -- Launch an application and optionally wait for it to load. Runs the program directly, never through a shell.
+  - Parameters: `command`, `args`, `wait_text`, `timeout`
+  - Reports `wait_text_found` so you can tell whether the app actually loaded.
 
 - **get_ocr_info** -- Get info about the active OCR backend and available backends.
   - Read-only: **true**
@@ -394,23 +439,36 @@ See the [examples/](examples/) directory for more.
 
 ```
 oswright/
-  __init__.py          # Package entry point
+  __init__.py          # Package entry point (single source of __version__)
   core.py              # OSWright class (= Browser)
   screen.py            # Screen class (= Page)
   locator.py           # Locator + Assertions (= Locator + expect)
-  capture.py           # Screen capture (mss - cross-platform)
+  capture.py           # Screen capture (mss - cross-platform, thread-safe)
   detect.py            # OCR dispatcher with caching (auto-selects best backend)
   _ocr_windows.py      # Windows OCR backend (instant, built-in)
   accessibility.py     # Windows UI Automation (deterministic element finding)
   cache.py             # Screenshot diffing, image hashing, OCR result cache
+  _dpi.py              # Process DPI awareness (keeps every API in physical pixels)
   input.py             # Platform dispatcher for input backends
   _input_windows.py    # Windows input backend (Win32 API)
   _input_pynput.py     # Linux/macOS input backend (pynput)
   window.py            # Window management (list, focus, close)
   clipboard.py         # Clipboard read/write (cross-platform)
-  mcp_server.py        # MCP server (35+ tools for AI agents)
+  mcp_server.py        # MCP server (36 tools for AI agents)
 tests/
-  test_core.py         # 22 automated tests
+  conftest.py          # Fixtures that skip when no display/OCR is available
+  test_core.py         # Unit tests (no desktop required)
+  test_e2e.py          # End-to-end tests against the real desktop (marked `e2e`)
+```
+
+## Development
+
+```bash
+pip install -e ".[dev]"
+
+pytest tests/                # everything available on this machine
+pytest tests/ -m "not e2e"   # unit tests only, no desktop needed
+ruff check oswright tests    # lint
 ```
 
 ## License

@@ -5,14 +5,15 @@ Analogous to Playwright's Page object.
 
 import logging
 import time
-from typing import Optional, Literal
+from collections.abc import Callable
+from typing import Literal, Optional
 
 from PIL import Image
 
 from oswright.capture import ScreenCapture
-from oswright.detect import OCREngine, ImageMatcher, ElementMatch
-from oswright.input import Mouse, Keyboard
-from oswright.locator import Locator
+from oswright.detect import ElementMatch, ImageMatcher, OCREngine
+from oswright.input import Keyboard, Mouse
+from oswright.locator import Locator, OSWrightError
 
 logger = logging.getLogger(__name__)
 
@@ -37,12 +38,55 @@ class Screen:
         ocr_languages: list[str] = None,
         timeout: float = 10.0,
         poll_interval: float = 0.5,
+        capture: Optional[ScreenCapture] = None,
+        ocr: Optional[OCREngine] = None,
+        ocr_provider: Optional[Callable[[], OCREngine]] = None,
     ):
+        """
+        Args:
+            monitor: Monitor index (0 = all monitors combined, 1 = primary).
+            ocr_languages: Languages for OCR (default: ['en']).
+            timeout: Default timeout in seconds for auto-wait operations.
+            poll_interval: How often to poll for elements during a wait.
+            capture: Share an existing ScreenCapture instead of creating one.
+            ocr: Share an existing OCREngine instead of creating one.
+            ocr_provider: Callable returning a shared OCREngine, invoked on first
+                use. Lets an owner share one engine without building it eagerly.
+        """
         self._monitor = monitor
         self._timeout = timeout
         self._poll_interval = poll_interval
-        self._capture = ScreenCapture()
-        self._ocr = OCREngine(languages=ocr_languages)
+        self._ocr_languages = ocr_languages
+
+        self._owns_capture = capture is None
+        self._capture = capture or ScreenCapture()
+
+        # The OCR engine is created on first use. Constructing it eagerly would
+        # load EasyOCR (and therefore torch) even for a script that only ever
+        # takes screenshots or uses the accessibility tree.
+        self._ocr = ocr
+        self._ocr_provider = ocr_provider
+
+    @property
+    def ocr(self) -> OCREngine:
+        """The OCR engine, created on first use."""
+        if self._ocr is None:
+            if self._ocr_provider is not None:
+                self._ocr = self._ocr_provider()
+            else:
+                self._ocr = OCREngine(languages=self._ocr_languages)
+        return self._ocr
+
+    def _offset(self, region: Optional[dict] = None) -> tuple[int, int]:
+        """Absolute screen coordinate of pixel (0, 0) of a capture."""
+        return self._capture.get_offset(region=region, monitor=self._monitor)
+
+    def _to_screen_coords(
+        self, matches: list[ElementMatch], region: Optional[dict] = None
+    ) -> list[ElementMatch]:
+        """Translate image-relative matches into absolute screen coordinates."""
+        dx, dy = self._offset(region)
+        return [m.offset(dx, dy) for m in matches]
 
     # --- Locator factory (Playwright's primary pattern) ---
 
@@ -69,11 +113,13 @@ class Screen:
         """
         return Locator(
             capture=self._capture,
-            ocr=self._ocr,
+            # Passed lazily so an image-only locator never constructs an OCR
+            # engine (or fails on a machine with no OCR backend installed).
+            ocr_provider=lambda: self.ocr,
             text=text,
             image=image,
             exact=exact,
-            timeout=timeout or self._timeout,
+            timeout=timeout if timeout is not None else self._timeout,
             poll_interval=self._poll_interval,
             region=region,
             monitor=self._monitor,
@@ -88,6 +134,15 @@ class Screen:
         return self.locator(image=image_path)
 
     # --- Direct actions (convenience shortcuts) ---
+
+    @staticmethod
+    def _check_coords(x: Optional[int], y: Optional[int]):
+        """Reject a half-specified coordinate pair instead of silently ignoring it."""
+        if (x is None) != (y is None):
+            raise OSWrightError(
+                "Both x and y must be provided together (got "
+                f"x={x!r}, y={y!r})."
+            )
 
     def click(
         self,
@@ -110,6 +165,7 @@ class Screen:
             clicks: Number of clicks.
             timeout: Override default timeout.
         """
+        self._check_coords(x, y)
         if x is not None and y is not None:
             Mouse.click(x, y, button=button, clicks=clicks)
         elif text or image:
@@ -128,6 +184,7 @@ class Screen:
         timeout: Optional[float] = None,
     ):
         """Double-click on screen."""
+        self._check_coords(x, y)
         if x is not None and y is not None:
             Mouse.double_click(x, y)
         elif text or image:
@@ -186,6 +243,7 @@ class Screen:
         x: Optional[int] = None, y: Optional[int] = None,
     ):
         """Scroll the mouse wheel at a position."""
+        self._check_coords(x, y)
         Mouse.scroll(amount, x, y)
 
     def drag(
@@ -206,19 +264,34 @@ class Screen:
         return self._capture.screenshot(path=path, region=region, monitor=self._monitor)
 
     def read_text(self, region: Optional[dict] = None) -> list[ElementMatch]:
-        """Read all visible text on screen using OCR."""
+        """
+        Read all visible text on screen using OCR.
+
+        Coordinates are absolute screen coordinates, ready to click.
+        """
         screenshot = self._capture.screenshot(region=region, monitor=self._monitor)
-        return self._ocr.read_all(screenshot)
+        return self._to_screen_coords(self.ocr.read_all(screenshot), region)
 
     def find_text(self, text: str, exact: bool = False, region: Optional[dict] = None) -> list[ElementMatch]:
-        """Find all occurrences of text on screen."""
-        screenshot = self._capture.screenshot(region=region, monitor=self._monitor)
-        return self._ocr.find_text(screenshot, text, exact=exact)
+        """
+        Find all occurrences of text on screen.
 
-    def find_image(self, template_path: str, threshold: float = 0.8) -> list[ElementMatch]:
-        """Find all occurrences of a template image on screen."""
-        screenshot = self._capture.screenshot(monitor=self._monitor)
-        return ImageMatcher.find_image(screenshot, template_path, threshold=threshold)
+        Coordinates are absolute screen coordinates, ready to click.
+        """
+        screenshot = self._capture.screenshot(region=region, monitor=self._monitor)
+        return self._to_screen_coords(self.ocr.find_text(screenshot, text, exact=exact), region)
+
+    def find_image(
+        self, template_path: str, threshold: float = 0.8, region: Optional[dict] = None
+    ) -> list[ElementMatch]:
+        """
+        Find all occurrences of a template image on screen.
+
+        Coordinates are absolute screen coordinates, ready to click.
+        """
+        screenshot = self._capture.screenshot(region=region, monitor=self._monitor)
+        matches = ImageMatcher.find_image(screenshot, template_path, threshold=threshold)
+        return self._to_screen_coords(matches, region)
 
     # --- Waiting ---
 
@@ -255,5 +328,13 @@ class Screen:
         return Mouse.get_position()
 
     def close(self):
-        """Release resources."""
-        self._capture.close()
+        """Release resources owned by this Screen."""
+        if self._owns_capture:
+            self._capture.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
