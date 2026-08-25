@@ -714,6 +714,126 @@ observability is just a bug with good manners.
 
 ---
 
+### 2.14 One application was hiding three bugs
+
+Every task number up to here came from Calculator. It is XAML, stateless, fully
+exposed to accessibility, and it always reopens in the same position — the
+easiest surface Windows has. "Accuracy is flat across configurations" rested
+entirely on it.
+
+Three more subjects went in behind one `Subject` interface: **File Explorer** (a
+native Win32 list view), **Chrome** (web content), and **VS Code** (Electron).
+Each needed ground truth that the perception layer has no hand in. Explorer is
+graded through UI Automation; Chrome and VS Code are graded through the **window
+title**, with the browser fixture reporting what was clicked by setting
+`document.title`. That trick is what makes it possible to grade web and Electron
+content without grading OCR with OCR.
+
+The corpus broke three claims within its first run.
+
+**A literal search cannot find text the recogniser mangled.** Asked for
+`bravo_notes.txt`, Windows OCR returned `bravo notes.b(t` — the underscore
+rendered as a space, the `x` as `(`. The text was plainly on screen, OCR had
+read it, and the task still failed. Separators are the usual casualty: thin,
+low-contrast, routinely dropped. Approximate matching is now a fallback used
+only after a literal search finds nothing, so it cannot change an answer that
+already worked, and it **refuses when two candidates score alike** — `alpha`,
+`bravo` and `charlie` variants of the same filename must not collapse into one
+answer. New subjects went from **5/12 to 11/12**.
+
+**Explorer does not show the filename you wrote to disk.** It hides known
+extensions, so the label is `meeting_notes`, and whether it does is a per-machine
+setting. The benchmark now resolves the target from the live window instead of
+hardcoding it — a benchmark that assumes its own fixtures are what the screen
+shows is measuring the wrong thing.
+
+**An entire IDE exposes 18 accessibility elements.** Probing VS Code returned
+`Minimize`, `Maximize`, `Restore`, `Close`, and one node named **`Chrome Legacy
+Window`** containing the whole interface. Not a shallow tree — an opaque one.
+OCR read 94 elements from the same frame, including every filename. This is the
+sharpest statement of the Electron blind spot I have, and it needs no benchmark
+harness to reproduce.
+
+---
+
+### 2.15 The benchmark was reading its own output
+
+The most valuable failure came from the corpus, and it was mine.
+
+`arithmetic by label` began failing 0/3 in **every pixel configuration** while
+passing 9/9 in the accessibility-only one. That shape — one perception path
+failing everywhere, another passing everywhere — is not a flake. The click trace
+said why:
+
+```
+Seven@r2(898,796)  Multiply by@r2(1133,795)  Eight@r1(1587,452)  Equals@r2(1133,936)
+```
+
+`Eight` resolved to x=1587. The Calculator window spans x 767..1185. The agent
+had clicked the word "Eight" **in my own terminal**, which was displaying the
+benchmark's output — including the labels it was searching for. The benchmark
+had become part of the screen it was measuring, and it fed itself: once a
+failure printed those labels, the next run found them.
+
+The underlying defect is oswright's, not the benchmark's. `window_title`
+constrained only the accessibility rungs; the pixel rungs read the whole screen
+and returned whatever they found first. The docstring said exactly that and was
+accurate — but the effect is that **an automation tool clicks an application the
+caller did not ask for**, which is a correctness problem before it is a
+perception one. The pixel rungs are now filtered to the named window's
+rectangle, and when no window is named nothing is filtered, because filtering
+against an unknown rectangle would discard every correct answer.
+
+After the fix, all four cascade configurations return **15/15**.
+
+**And a correction I want on the record.** Earlier in the same session I saw a
+click land at (600, 66) for a file that was at (211, 157), concluded the screen
+model was serving stale coordinates, and built a currency check for it. That
+check is sound and I kept it — answering from memory that nothing has verified
+is indefensible, and the atlas had verified its answers from the start while the
+model never did. But (600, 66) turned out to sit inside my own maximised session
+window. **The evidence I cited was the scoping bug, not staleness.** I fixed a
+real weakness for the wrong reason, and only found out because a later fix made
+the symptom disappear. Both fixes stand; the reasoning that produced the first
+one does not.
+
+---
+
+### 2.16 Measuring the argument instead of making it
+
+The architectural claim has always been that **neither pixels nor accessibility
+wins everywhere, so route per query**. That is precisely the bet other Windows
+GUI agents take the other way, with accessibility-only designs. It had been
+argued for six versions and never measured.
+
+Two ablation configurations now isolate each half — `accessibility only`, which
+is the competing posture, and `pixels only`.
+
+| configuration | Calculator | File Explorer | Chrome |
+|---|---|---|---|
+| full cascade (4 variants) | **9/9** | **3/3** | **3/3** |
+| accessibility only | 9/9 | **0/3** | **0/3** |
+| pixels only | **6/9** | 3/3 | 3/3 |
+
+Each single-mode posture is blind exactly where the design predicted, and for
+reasons that are legible rather than statistical:
+
+- **Accessibility-only is blind outside XAML.** It is perfect on Calculator and
+  scores zero on Explorer's list view and on web content. On VS Code it also
+  scores zero, against an interface it can only see as one opaque node.
+- **Pixels-only fails on Calculator's buttons**, because the button a human
+  reads as `7` is *named* `Seven`, and OCR returns no digits from Calculator at
+  all. The label a person sees and the label a machine exposes are different
+  strings, and no amount of perception engineering reconciles them.
+
+The cascade is the only configuration that passes everywhere. That is the first
+evidence for the central design decision that is not an argument — and it was a
+genuine risk to run, because a result showing accessibility-only matching the
+cascade everywhere would have meant the simpler competing design was right and
+this one is over-engineered.
+
+---
+
 ## Part 3 — Results
 
 Measured over a 14-step agent loop at 1920×1080:
@@ -797,6 +917,33 @@ Worth knowing, because these are the questions an interviewer will ask.
     sweep with one task failing in all four configurations read as a real
     defect; the next identical sweep returned 36/36 (§2.12). I built the
     hypothesis before confirming the finding.
+
+20. **Trusted one application to stand for all of them.** Every accuracy claim
+    rested on Calculator, the easiest surface Windows has, and three of the
+    four claims broke within one run of a wider corpus (§2.14).
+21. **Let `window_title` mean one thing in the docs and another in effect.** It
+    constrained only the accessibility rungs, so the pixel rungs could click a
+    different application entirely (§2.15). Accurate documentation of wrong
+    behaviour is still wrong behaviour.
+22. **Let the benchmark become part of the screen it measured.** Its own console
+    output contained the labels it was searching for, and the agent clicked them
+    (§2.15). A measurement apparatus that is visible to the thing it measures is
+    not neutral.
+23. **Diagnosed a real weakness from the wrong evidence.** I attributed a
+    misplaced click to a stale screen model and built a currency check for it;
+    the coordinate turned out to be inside my own window (§2.15). The fix was
+    worth keeping and the reasoning was not, which is an uncomfortable pair to
+    hold at once.
+24. **Wrote a test that pinned a bug in place.** `test_model_hit_costs_nothing`
+    asserted only that the fastest rung was fast, and said nothing about whether
+    its answer was right, so the unsound behaviour it guarded survived every
+    run (§2.15). A test that encodes an optimisation without its precondition
+    protects the optimisation from being corrected.
+25. **Guessed at a cause and started implementing before measuring.** I decided
+    low-contrast verifier regions explained a false prediction and began writing
+    an entropy threshold; measuring first showed those regions score 31–62
+    standard deviation, nowhere near uniform. The hypothesis was wrong and the
+    measurement took four minutes.
 
 Approaches investigated and rejected on evidence:
 
