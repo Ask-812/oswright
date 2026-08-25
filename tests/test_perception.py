@@ -556,6 +556,55 @@ class TestCascadeRanking:
         assert (payload["x"], payload["y"]) == (30, 16)
 
 
+class TestShortQueryRouting:
+    """
+    Very short targets go to the accessibility tree first.
+
+    OCR does not merely misread isolated glyphs, it does not detect them.
+    Measured on Calculator, Windows OCR returned 30 text elements from the
+    window (DEG, MC, Function, Trigonometry, log...) and not one digit: text
+    recognisers are trained on words and lines, and a lone character on a button
+    has no line context to belong to. For such targets the pixel rungs are a
+    guaranteed miss, not a cheaper path to the same answer.
+    """
+
+    def test_short_queries_prefer_accessibility(self):
+        from oswright.cascade import _prefers_accessibility
+
+        for query in ("7", "8", "OK", "X"):
+            assert _prefers_accessibility(query, exact=False), query
+
+    def test_word_queries_do_not(self):
+        from oswright.cascade import _prefers_accessibility
+
+        for query in ("Save", "Cancel", "File", "Multiply by"):
+            assert not _prefers_accessibility(query, exact=False), query
+
+    def test_whitespace_does_not_inflate_length(self):
+        from oswright.cascade import _prefers_accessibility
+
+        assert _prefers_accessibility("  7  ", exact=False)
+
+    def test_short_query_tries_uia_before_pixels(self, model):
+        """The routing must show up in the order rungs are attempted."""
+        from oswright.cascade import resolve
+
+        model._ocr.items = []
+        model.observe(image=TaggedImage(frame((640, 480))))
+
+        result = resolve("7", model, allow_text_pattern=False, allow_full_rescan=False)
+        assert result.rungs_tried[:2] == ["model", "uia-first"]
+
+    def test_long_query_keeps_the_cheap_path_first(self, model):
+        from oswright.cascade import resolve
+
+        model._ocr.items = []
+        model.observe(image=TaggedImage(frame((640, 480))))
+
+        result = resolve("Save", model, allow_text_pattern=False, allow_full_rescan=False)
+        assert result.rungs_tried[:2] == ["model", "incremental"]
+
+
 class TestCascadeOrder:
     def test_model_hit_costs_nothing(self, model):
         from oswright.cascade import resolve

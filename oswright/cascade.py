@@ -125,6 +125,24 @@ def _rank(candidates: list[Candidate], query: str) -> list[Candidate]:
     return sorted(candidates, key=key)
 
 
+def _prefers_accessibility(query: str, exact: bool) -> bool:
+    """
+    Should the accessibility tree be tried before the pixel rungs?
+
+    OCR does not merely misread very short labels -- it does not detect them at
+    all. Measured on Calculator, Windows OCR returned 30 text elements from the
+    window (DEG, MC, Function, Trigonometry, log...) and **not one digit**. OCR
+    engines are trained on words and lines; an isolated glyph on a button has no
+    line context to belong to.
+
+    So for one- and two-character targets the pixel rungs are not a cheaper path
+    to the same answer, they are a guaranteed miss followed by the accessibility
+    rung anyway. Trying accessibility first is both faster and more likely to
+    work.
+    """
+    return len(query.strip()) <= 2
+
+
 def resolve(
     query: str,
     model: ScreenModel,
@@ -164,6 +182,13 @@ def resolve(
     hits = model.find(query, exact=exact)
     if hits:
         return finish(_from_elements(hits, 0), 0, "model")
+
+    # For targets OCR cannot see at all, go straight to the accessibility tree
+    # rather than paying for two pixel passes that are certain to miss.
+    if allow_uia and _prefers_accessibility(query, exact):
+        result.rungs_tried.append("uia-first")
+        for candidate in _uia_candidates(query, exact, window_title):
+            return finish([candidate], 2, "uia")
 
     # Rung 1 -- refresh only what moved, then look again. This is the common
     # path when the agent has just acted and the target has appeared.
