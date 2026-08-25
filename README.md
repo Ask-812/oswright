@@ -178,11 +178,15 @@ Measured on this machine over a 14-step agent loop:
 
 | | v0.4.0 (full OCR + screenshot) | incremental |
 |---|---|---|
-| Median latency per step | 185 ms | **33 ms** |
+| Median latency per step | 212 ms | **33 ms** |
 | Tokens per observation | ~2,764 | **~49** |
-| Tokens over 14 steps | 38,696 | **3,930** |
-| Lookup of already-known text | 318 ms | **0.055 ms** |
-| Screen re-read | 100% | **11.5%** |
+| Tokens over 14 steps | 38,696 | **1,025** |
+| Screen re-read | 100% | **16%** |
+
+The busier the screen, the larger the gap: full OCR scales with how much text is
+on screen, whereas the incremental path scales with how much *changed*. The same
+comparison measures 6.5× on a quiet desktop and **14.3×** with a dense web page
+open. Re-measure with [`benchmarks/`](benchmarks/) rather than trusting these.
 
 ### The resolution cascade
 
@@ -218,15 +222,19 @@ milliseconds of cross-process COM — it is the accurate rung, not the fast one.
 
 On Windows, the desktop compositor already knows which pixels changed and
 exposes them through DXGI Desktop Duplication. Asking it costs **0.14 ms and
-transfers no pixels**, against ~48 ms to capture a frame and discover it was
-identical — so an idle observation skips the capture entirely.
+transfers no pixels**, against tens of milliseconds to capture a frame and
+discover it was identical — so an idle observation skips the capture entirely.
 
-The compositor is used only as a fast *negative*. When it reports a change, the
-regions still come from hashing the captured frame: the two are measured over
-slightly different intervals, so compositor rectangles can under-report relative
-to the pixels actually captured, and an under-reported region is text that never
-gets re-read. It degrades silently to tile hashing wherever Desktop Duplication
-is unavailable.
+When something *has* changed, the compositor is left holding that frame, so its
+pixels are read directly from the GPU rather than grabbed a second time through
+a different API — **1.5–2.3× faster** than `mss` in measurements here.
+
+The compositor is used only as a fast *negative* for change detection. When it
+reports a change, the dirty regions still come from hashing the captured frame:
+the two are measured over slightly different intervals, so compositor rectangles
+can under-report relative to the pixels actually captured, and an under-reported
+region is text that never gets re-read. It degrades silently to tile hashing and
+normal capture wherever Desktop Duplication is unavailable.
 
 Enable delta observations for action tools with `--observation-mode delta`.
 The default remains `screenshot` for compatibility with existing clients.
@@ -576,15 +584,14 @@ tests/
 
 Deliberately left for later, in rough order of expected value:
 
-- **Read pixels from the DXGI texture already acquired.** Screen capture is now
-  the largest remaining cost per observation (~33–48 ms), and the compositor
-  path already holds the frame — a second `mss` grab is redundant.
 - **A persistent per-application UI atlas.** Applications are deterministic: the
   same dialog has the same layout every time. Caching layouts across sessions
   would make repeat visits close to free.
 - **Speculative perception.** With an atlas and the change oracle that now
   exists, an agent could predict the post-action screen and verify the
   prediction rather than re-perceiving. Correct predictions would cost nothing.
+- **Wayland input injection**, and macOS `AXTextMarker` as a TextPattern
+  equivalent.
 
 ## Development
 

@@ -156,6 +156,7 @@ class ScreenModel:
             "observations": 0,
             "full_rescans": 0,
             "compositor_skips": 0,
+            "compositor_captures": 0,
             "regions_scanned": 0,
             "pixels_scanned": 0,
             "pixels_total": 0,
@@ -199,7 +200,7 @@ class ScreenModel:
             )
 
         if image is None:
-            image = self._capture.screenshot(monitor=self._monitor)
+            image = self._acquire_frame()
 
         width, height = image.size
         total_pixels = width * height
@@ -258,6 +259,25 @@ class ScreenModel:
             duration_ms=(time.perf_counter() - started) * 1000,
             full_rescan=full,
         )
+
+    def _acquire_frame(self):
+        """
+        Get the current screen image, preferring the frame the compositor is
+        already holding over an independent capture of the same pixels.
+        """
+        expected = None
+        try:
+            size = self._capture.get_screen_size(self._monitor)
+            expected = (size["width"], size["height"])
+        except Exception:
+            pass
+
+        frame = self._tracker.capture_frame(expected_size=expected)
+        if frame is not None:
+            self.stats["compositor_captures"] += 1
+            return frame
+
+        return self._capture.screenshot(monitor=self._monitor)
 
     def _close_over_elements(
         self, regions: list[Region], width: int, height: int, max_passes: int = 6
@@ -335,6 +355,7 @@ class ScreenModel:
             "observations": self.stats["observations"],
             "full_rescans": self.stats["full_rescans"],
             "compositor_skips": self.stats["compositor_skips"],
+            "compositor_captures": self.stats["compositor_captures"],
             "compositor_active": self._tracker.compositor_active,
             "pixels_scanned": scanned,
             "pixels_total": total,

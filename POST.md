@@ -65,6 +65,42 @@ Works with Claude Desktop, VS Code, Cursor, Windsurf, Cline, Goose, and any MCP 
 
 ## Version History
 
+### v0.5.2 — Capture from the GPU
+
+v0.5.1 acquires a compositor frame to learn what changed, then threw those
+pixels away and grabbed the same image again through `mss`. Now it reads them
+directly: **1.5–2.3× faster than `mss`**, verified against an `mss` frame of
+the same screen (0.003% of pixels differed, which is live screen change between
+the two captures).
+
+`MapDesktopSurface` would have made this trivial, but requires the desktop image
+to live in system memory, and it does not here — `DesktopImageInSystemMemory` is
+False and the call returns `DXGI_ERROR_UNSUPPORTED`. The working path is the
+full one: `QueryInterface` to `ID3D11Texture2D`, a CPU-readable staging texture,
+`CopyResource` on the GPU, then `Map` and read BGRA rows honouring `RowPitch`.
+
+That needs `ID3D11DeviceContext::CopyResource`, which sits at vtable slot 40.
+COM dispatches by offset, so all forty preceding methods must occupy their
+slots — generated in a loop rather than hand-written, because one misplaced
+entry is memory corruption rather than an error message.
+
+Two guards worth noting. Desktop Duplication output 0 is the *primary monitor*
+while `mss` monitor 0 is the *whole virtual desktop*; on a multi-monitor setup
+substituting one for the other would put every derived coordinate in the wrong
+place, so the frame is rejected unless its size matches what was expected. And
+a frame only exists if the compositor presented one — on a fully idle screen
+there is nothing to capture, which is harmless because an unchanged screen does
+not need re-reading.
+
+End to end, on a busy screen: **639 ms → 45 ms per step (14.3×)** and
+**38,696 → 1,025 tokens over 14 steps (38×)**.
+
+A note on variance, now documented in the engineering log: absolute timings here
+move by up to 3× between runs, because OCR cost scales with how much text is on
+screen. That is the point — full rescans get worse as the screen gets busier,
+while the incremental path scales with how much *changed*. The same benchmark
+measures 6.5× on a quiet desktop and 14.3× with a dense web page open.
+
 ### v0.5.1 — Compositor-driven change detection
 
 The Windows compositor already knows which pixels changed — it has to, in order

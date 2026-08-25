@@ -119,6 +119,28 @@ def _windows_rows(cap):
     if tracker.compositor_active:
         ms, _ = bench(lambda: tracker.nothing_changed(), reps=10)
         rows.append(("compositor change poll (no pixels)", ms, "DXGI dirty rects"))
+
+        # Capture from the frame the compositor already holds, versus a second
+        # independent grab of the same pixels through mss. A frame only exists
+        # when something was presented, so wait briefly for one rather than
+        # measuring an idle screen and getting no samples.
+        source = tracker._get_compositor()
+        samples = []
+        for _ in range(15):
+            if source.poll(timeout_ms=120):
+                t = time.perf_counter()
+                frame = source.capture()
+                if frame is not None:
+                    samples.append((time.perf_counter() - t) * 1000)
+            time.sleep(0.05)
+        if samples:
+            rows.append((
+                "capture via DXGI staging copy",
+                statistics.median(samples),
+                f"{len(samples)} samples",
+            ))
+        else:
+            rows.append(("capture via DXGI staging copy", float("nan"), "no frames presented"))
     tracker.close()
     return rows
 
