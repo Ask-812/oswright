@@ -69,10 +69,18 @@ mcp = FastMCP(
 
 _capture: Optional[ScreenCapture] = None
 _ocr: Optional[OCREngine] = None
+_model = None
 # Separate locks: building the OCR engine can take seconds on EasyOCR, and it
 # must not block an unrelated screenshot.
 _capture_lock = threading.Lock()
 _ocr_lock = threading.Lock()
+_model_lock = threading.Lock()
+
+# How action tools report the resulting screen state:
+#   screenshot - a full image every time (default; what every MCP client expects)
+#   delta      - only what changed since the last observation
+#   both       - the delta plus the image
+_observation_mode: str = "screenshot"
 _ocr_languages: list[str] = ["en"]
 _default_timeout: float = 10.0
 _default_poll_interval: float = 0.5
@@ -188,6 +196,43 @@ def _take_snapshot_image() -> MCPImage:
     return _encode_png(_get_capture().screenshot())
 
 
+def _get_model():
+    """Lazy-init the incremental screen model."""
+    global _model
+    with _model_lock:
+        if _model is None:
+            from oswright.screenmodel import ScreenModel
+
+            _model = ScreenModel(_get_capture(), _get_ocr())
+        return _model
+
+
+def _observation() -> list:
+    """
+    Build the post-action observation.
+
+    A full screenshot of a 1920x1080 screen costs roughly 2,800 image tokens,
+    and an agent taking fifty actions pays that fifty times over to look at a
+    screen that changed by a fraction of a percent. In `delta` mode it instead
+    receives the handful of strings that actually appeared or disappeared, which
+    also states what happened rather than asking the model to spot the
+    difference between two pictures.
+    """
+    if _observation_mode == "screenshot":
+        return [_take_snapshot_image()]
+
+    try:
+        delta = _get_model().observe()
+    except Exception as e:
+        logger.warning("Delta observation failed, falling back to screenshot: %s", e)
+        return [_take_snapshot_image()]
+
+    payload = json.dumps({"observation": delta.to_dict()})
+    if _observation_mode == "both":
+        return [payload, _take_snapshot_image()]
+    return [payload]
+
+
 def _is_loopback(host: str) -> bool:
     """True if `host` only accepts connections from this machine."""
     import ipaddress
@@ -264,7 +309,7 @@ def _act_on_text(
             "target": [match.x, match.y],
             "confidence": round(match.confidence, 3),
         }),
-        _take_snapshot_image(),
+        *_observation(),
     ]
 
 
@@ -548,7 +593,7 @@ def mouse_click(
     pos = Mouse.get_position()
     return [
         json.dumps({"action": "click", "button": button, "clicks": clicks, "position": pos}),
-        _take_snapshot_image(),
+        *_observation(),
     ]
 
 
@@ -571,7 +616,7 @@ def mouse_double_click(x: Optional[int] = None, y: Optional[int] = None) -> list
     pos = Mouse.get_position()
     return [
         json.dumps({"action": "double_click", "position": pos}),
-        _take_snapshot_image(),
+        *_observation(),
     ]
 
 
@@ -603,7 +648,7 @@ def mouse_scroll(amount: int, x: Optional[int] = None, y: Optional[int] = None) 
     time.sleep(0.3)
     return [
         json.dumps({"action": "scroll", "amount": amount}),
-        _take_snapshot_image(),
+        *_observation(),
     ]
 
 
@@ -632,7 +677,7 @@ def mouse_drag(
             "from": [start_x, start_y],
             "to": [end_x, end_y],
         }),
-        _take_snapshot_image(),
+        *_observation(),
     ]
 
 
@@ -662,7 +707,7 @@ def type_text(text: str, delay: float = 0.02) -> list:
     time.sleep(0.2)
     return [
         json.dumps({"action": "type_text", "length": len(text)}),
-        _take_snapshot_image(),
+        *_observation(),
     ]
 
 
@@ -681,7 +726,7 @@ def press_key(key: str) -> list:
     time.sleep(0.3)
     return [
         json.dumps({"action": "press_key", "key": key}),
-        _take_snapshot_image(),
+        *_observation(),
     ]
 
 
@@ -903,7 +948,7 @@ def fill_field(
             "value": value,
             "clicked_at": [match.x, match.y],
         }),
-        _take_snapshot_image(),
+        *_observation(),
     ]
 
 
@@ -923,7 +968,7 @@ def wait_for_time(seconds: float) -> list:
     time.sleep(seconds)
     return [
         json.dumps({"action": "wait", "waited_seconds": seconds}),
-        _take_snapshot_image(),
+        *_observation(),
     ]
 
 
@@ -975,7 +1020,7 @@ def fill_form(
 
     return [
         json.dumps(result),
-        _take_snapshot_image(),
+        *_observation(),
     ]
 
 
@@ -1034,7 +1079,7 @@ def focus_window(title: str) -> list:
                 "handle": win.handle,
                 "position": [win.left, win.top, win.width, win.height],
             }),
-            _take_snapshot_image(),
+            *_observation(),
         ]
     return [json.dumps({"action": "focus_window", "error": f"Window '{title}' not found"})]
 
@@ -1060,7 +1105,7 @@ def close_window(title: str) -> list:
             "title": title,
             "success": success,
         }),
-        _take_snapshot_image(),
+        *_observation(),
     ]
 
 
@@ -1084,7 +1129,7 @@ def minimize_window(title: str) -> list:
             "title": title,
             "success": success,
         }),
-        _take_snapshot_image(),
+        *_observation(),
     ]
 
 
@@ -1233,7 +1278,7 @@ def launch_app(
             # success just because a wait was requested.
             **({"wait_text": wait_text, "wait_text_found": found} if wait_text else {}),
         }),
-        _take_snapshot_image(),
+        *_observation(),
     ]
 
 
@@ -1255,6 +1300,130 @@ def get_ocr_info() -> str:
         "active_backend": ocr.backend_name,
         "available_backends": _OCR_BACKENDS,
         "languages": ocr._languages,
+    })
+
+
+# =========================================================================
+# INCREMENTAL PERCEPTION TOOLS
+# =========================================================================
+
+
+@mcp.tool(annotations=_READONLY)
+def observe(force_full: bool = False) -> str:
+    """
+    Report what changed on screen since the last observation.
+
+    Prefer this over `screenshot` for tracking state. It maintains a running
+    model of on-screen text and rescans only the regions that actually moved,
+    so it costs a fraction of a full screen read and returns tens of tokens
+    instead of thousands. The first call scans everything.
+
+    Args:
+        force_full: Rescan the entire screen instead of only what changed.
+                    Use if you suspect the model has drifted.
+    """
+    delta = _get_model().observe(force_full=force_full)
+    return json.dumps(delta.to_dict())
+
+
+@mcp.tool(annotations=_READONLY)
+def find_element(
+    text: str,
+    exact: bool = False,
+    window_title: Optional[str] = None,
+) -> str:
+    """
+    Find on-screen text using the cheapest method that can answer.
+
+    Tries, in order: the existing screen model (free), an incremental rescan of
+    changed regions, the accessibility tree, the application's own text buffer,
+    and finally a full screen read. Returns coordinates ready for mouse_click,
+    plus which rung answered.
+
+    Args:
+        text: The visible text to find.
+        exact: Require the label to equal `text` rather than contain it.
+        window_title: Restrict accessibility lookups to one window.
+    """
+    from oswright.cascade import resolve
+
+    return json.dumps(resolve(text, _get_model(), exact=exact, window_title=window_title).to_dict())
+
+
+@mcp.tool(annotations=_INPUT)
+def click_element(
+    text: str,
+    exact: bool = False,
+    button: Literal["left", "right", "middle"] = "left",
+    window_title: Optional[str] = None,
+) -> list:
+    """
+    Find on-screen text via the resolution cascade and click it.
+
+    The cheaper alternative to click_text: it reuses what is already known about
+    the screen instead of running OCR over the whole display on every call.
+
+    Args:
+        text: The visible text to find and click.
+        exact: Require the label to equal `text` rather than contain it.
+        button: Mouse button.
+        window_title: Restrict accessibility lookups to one window.
+    """
+    from oswright.cascade import resolve
+
+    with _action_lock:
+        result = resolve(text, _get_model(), exact=exact, window_title=window_title)
+        if not result.found:
+            return [json.dumps({"action": "click_element", **result.to_dict()})]
+
+        x, y = result.best.center
+        Mouse.click(x, y, button=button)
+        time.sleep(0.3)
+
+    return [
+        json.dumps({
+            "action": "click_element",
+            "clicked": result.best.to_dict(),
+            "rung": result.rung,
+            "source": result.source,
+            "duration_ms": round(result.duration_ms, 1),
+        }),
+        *_observation(),
+    ]
+
+
+@mcp.tool(annotations=_READONLY)
+def read_model_text(query: Optional[str] = None, limit: int = 200) -> str:
+    """
+    Read on-screen text from the incremental model.
+
+    Unlike read_screen_text this does not re-OCR the display; it refreshes only
+    the regions that changed and then answers from the model.
+
+    Args:
+        query: Optional substring filter.
+        limit: Maximum elements to return.
+    """
+    model = _get_model()
+    model.observe()
+    elements = model.find(query) if query else model.elements
+    elements = sorted(elements, key=lambda e: (e.region.top, e.region.left))
+    return json.dumps({
+        "element_count": len(elements),
+        "returned": min(len(elements), limit),
+        "elements": [e.to_dict() for e in elements[:limit]],
+    })
+
+
+@mcp.tool(annotations=_READONLY)
+def perception_stats() -> str:
+    """
+    Report how much perception work the incremental model has avoided.
+    Useful for verifying the screen model is actually saving effort.
+    """
+    return json.dumps({
+        "observation_mode": _observation_mode,
+        **_get_model().efficiency(),
     })
 
 
@@ -1329,7 +1498,7 @@ def click_ui_element(
                 "action": "click_ui_element",
                 "clicked": el.to_dict(),
             }),
-            _take_snapshot_image(),
+            *_observation(),
         ]
     return [json.dumps({
         "action": "click_ui_element",
@@ -1372,7 +1541,7 @@ def fill_ui_element(
             "name": name,
             "value": value,
         }),
-        _take_snapshot_image(),
+        *_observation(),
     ]
 
 
@@ -1470,7 +1639,7 @@ def wait_for_change(
 
 def main():
     """Run the OSWright MCP server."""
-    global _ocr_languages, _default_timeout, _snapshot_max_width
+    global _ocr_languages, _default_timeout, _snapshot_max_width, _observation_mode
 
     parser = argparse.ArgumentParser(
         prog="oswright",
@@ -1503,6 +1672,16 @@ def main():
             "Downscale the auto-snapshot returned by action tools to at most this "
             "width. 0 (default) keeps full resolution. Lower values cut token cost "
             "substantially; coordinates from OCR tools stay in real screen pixels."
+        ),
+    )
+    parser.add_argument(
+        "--observation-mode", type=str, default=None,
+        choices=["screenshot", "delta", "both"],
+        help=(
+            "What action tools return as the resulting screen state. "
+            "'screenshot' (default) returns a full image, costing ~2800 image "
+            "tokens per action. 'delta' returns only the text that appeared or "
+            "disappeared, typically a few dozen tokens. 'both' returns each."
         ),
     )
     parser.add_argument(
@@ -1542,6 +1721,14 @@ def main():
         _snapshot_max_width = max(0, args.snapshot_max_width)
     elif os.environ.get("OSWRIGHT_SNAPSHOT_MAX_WIDTH"):
         _snapshot_max_width = max(0, int(os.environ["OSWRIGHT_SNAPSHOT_MAX_WIDTH"]))
+
+    _observation_mode = (
+        args.observation_mode
+        or os.environ.get("OSWRIGHT_OBSERVATION_MODE")
+        or "screenshot"
+    ).lower()
+    if _observation_mode not in ("screenshot", "delta", "both"):
+        parser.error(f"Invalid observation mode: {_observation_mode!r}")
 
     log_level = (
         args.log_level

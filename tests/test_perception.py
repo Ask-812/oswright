@@ -1,0 +1,431 @@
+"""
+Tests for the incremental perception layer.
+
+These use synthetic images and a stub OCR engine, so they run without a display
+or an OCR backend and are safe in CI.
+"""
+
+import pytest
+from PIL import Image, ImageDraw
+
+from oswright.dirty import (
+    TILE,
+    DirtyTracker,
+    Region,
+    merge_regions,
+    tile_signature,
+)
+
+
+def frame(size=(640, 480), color="white"):
+    return Image.new("RGB", size, color)
+
+
+def with_box(img, box, color="black"):
+    out = img.copy()
+    ImageDraw.Draw(out).rectangle(box, fill=color)
+    return out
+
+
+class TestRegion:
+    def test_dimensions(self):
+        r = Region(10, 20, 40, 60)
+        assert (r.width, r.height, r.area) == (30, 40, 1200)
+
+    def test_intersects(self):
+        a = Region(0, 0, 10, 10)
+        assert a.intersects(Region(5, 5, 15, 15))
+        assert not a.intersects(Region(10, 0, 20, 10)), "touching edges do not overlap"
+        assert not a.intersects(Region(100, 100, 110, 110))
+
+    def test_union(self):
+        assert Region(0, 0, 10, 10).union(Region(20, 5, 30, 40)) == Region(0, 0, 30, 40)
+
+    def test_clamp(self):
+        assert Region(-50, -50, 5000, 5000).clamp(800, 600) == Region(0, 0, 800, 600)
+
+    def test_padded_is_wider_than_tall(self):
+        """Text runs horizontally, so cutting a line vertically splits words."""
+        r = Region(100, 100, 200, 120).padded()
+        assert r.width - 100 > r.height - 20
+
+
+class TestTileSignature:
+    def test_identical_frames_match(self):
+        a = frame()
+        assert (tile_signature(np_of(a)) == tile_signature(np_of(a))).all()
+
+    def test_change_is_detected(self):
+        a = frame()
+        b = with_box(a, [100, 100, 140, 130])
+        assert not (tile_signature(np_of(a)) == tile_signature(np_of(b))).all()
+
+    def test_position_weighting_catches_rearrangement(self):
+        """A plain sum would collide when pixels merely move within a tile."""
+        a = frame((TILE, TILE))
+        b = a.copy()
+        a.putpixel((2, 2), (0, 0, 0))
+        b.putpixel((40, 40), (0, 0, 0))
+        assert not (tile_signature(np_of(a)) == tile_signature(np_of(b))).all()
+
+    def test_rejects_non_image_array(self):
+        import numpy as np
+
+        with pytest.raises(ValueError):
+            tile_signature(np.zeros((10, 10)))
+
+
+class TestMergeRegions:
+    def test_overlapping_merge(self):
+        merged = merge_regions([Region(0, 0, 10, 10), Region(5, 5, 20, 20)])
+        assert merged == [Region(0, 0, 20, 20)]
+
+    def test_disjoint_kept_separate(self):
+        regions = [Region(0, 0, 10, 10), Region(500, 500, 510, 510)]
+        assert len(merge_regions(regions)) == 2
+
+    def test_chain_merges_transitively(self):
+        chain = [Region(0, 0, 10, 10), Region(8, 0, 20, 10), Region(18, 0, 30, 10)]
+        assert merge_regions(chain) == [Region(0, 0, 30, 10)]
+
+    def test_empty(self):
+        assert merge_regions([]) == []
+
+
+class TestDirtyTracker:
+    def test_first_frame_is_fully_dirty(self):
+        regions = DirtyTracker().update(frame((800, 600)))
+        assert regions == [Region(0, 0, 800, 600)]
+
+    def test_identical_frame_is_clean(self):
+        t = DirtyTracker()
+        img = frame()
+        t.update(img)
+        assert t.update(img) == []
+
+    def test_small_change_yields_small_region(self):
+        t = DirtyTracker()
+        img = frame((1920, 1080))
+        t.update(img)
+        regions = t.update(with_box(img, [900, 500, 940, 520]))
+        assert len(regions) == 1
+        assert DirtyTracker.coverage(regions, 1920, 1080) < 0.05
+
+    def test_change_is_covered_by_reported_region(self):
+        """The whole point: the changed pixels must be inside a dirty region."""
+        t = DirtyTracker()
+        img = frame((1920, 1080))
+        t.update(img)
+        box = (900, 500, 940, 520)
+        regions = t.update(with_box(img, list(box)))
+        changed = Region(*box)
+        assert any(
+            r.left <= changed.left and r.top <= changed.top
+            and r.right >= changed.right and r.bottom >= changed.bottom
+            for r in regions
+        )
+
+    def test_distant_changes_stay_separate(self):
+        t = DirtyTracker()
+        img = frame((1920, 1080))
+        t.update(img)
+        two = with_box(with_box(img, [50, 50, 90, 70]), [1700, 950, 1740, 970])
+        assert len(t.update(two)) == 2
+
+    def test_resize_forces_full_rescan(self):
+        t = DirtyTracker()
+        t.update(frame((1920, 1080)))
+        assert t.update(frame((800, 600))) == [Region(0, 0, 800, 600)]
+
+    def test_reset(self):
+        t = DirtyTracker()
+        img = frame()
+        t.update(img)
+        t.reset()
+        assert t.update(img) == [Region(0, 0, *img.size)]
+
+
+# --- ScreenModel, driven by a stub OCR so no backend is required -------------
+
+
+class StubMatch:
+    def __init__(self, text, left, top, width=40, height=12):
+        self.text, self.left, self.top = text, left, top
+        self.width, self.height = width, height
+        self.confidence = 0.99
+
+
+class StubCache:
+    def invalidate(self):
+        pass
+
+
+class StubOCR:
+    """Returns whatever text has been placed at given coordinates."""
+
+    def __init__(self):
+        self.items = []          # (text, left, top) in absolute coords
+        self._cache = StubCache()
+        self.calls = 0
+        self.pixels = 0
+
+    def read_all(self, image):
+        self.calls += 1
+        self.pixels += image.size[0] * image.size[1]
+        # The model passes crops, so report anything inside this crop's bounds
+        # relative to the crop, mirroring how a real engine behaves.
+        origin = getattr(image, "_origin", (0, 0))
+        w, h = image.size
+        out = []
+        for text, left, top in self.items:
+            if origin[0] <= left < origin[0] + w and origin[1] <= top < origin[1] + h:
+                out.append(StubMatch(text, left - origin[0], top - origin[1]))
+        return out
+
+
+class TaggedImage:
+    """Wraps a PIL image so crops remember where they came from."""
+
+    def __init__(self, img, origin=(0, 0)):
+        self._img = img
+        self._origin = origin
+
+    @property
+    def size(self):
+        return self._img.size
+
+    def convert(self, mode):
+        return self._img.convert(mode)
+
+    def crop(self, box):
+        return TaggedImage(self._img.crop(box), (box[0], box[1]))
+
+
+def np_of(img):
+    import numpy as np
+
+    return np.asarray(img.convert("RGB"))
+
+
+class StubCapture:
+    """Serves a fixed frame, so cascade rungs that capture can be tested."""
+
+    def __init__(self, image=None):
+        self.image = image if image is not None else TaggedImage(frame((640, 480)))
+        self.calls = 0
+
+    def screenshot(self, monitor=0, **kwargs):
+        self.calls += 1
+        return self.image
+
+    def get_offset(self, region=None, monitor=0):
+        return (0, 0)
+
+
+@pytest.fixture
+def model():
+    from oswright.screenmodel import ScreenModel
+
+    return ScreenModel(capture=StubCapture(), ocr=StubOCR())
+
+
+class TestElement:
+    def test_center(self):
+        from oswright.screenmodel import Element
+
+        e = Element("Save", Region(100, 50, 140, 70))
+        assert e.center == (120, 60)
+
+    def test_fingerprint_is_stable(self):
+        from oswright.screenmodel import Element
+
+        a = Element("Save", Region(10, 10, 50, 30))
+        b = Element("Save", Region(10, 10, 50, 30))
+        assert a.fingerprint == b.fingerprint
+
+    def test_fingerprint_tracks_text_and_position(self):
+        from oswright.screenmodel import Element
+
+        base = Element("Save", Region(10, 10, 50, 30))
+        assert base.fingerprint != Element("Open", Region(10, 10, 50, 30)).fingerprint
+        assert base.fingerprint != Element("Save", Region(11, 10, 51, 30)).fingerprint
+
+
+class TestScreenModel:
+    def test_first_observation_scans_everything(self, model):
+        model._ocr.items = [("Hello", 100, 100)]
+        delta = model.observe(image=TaggedImage(frame((640, 480))))
+        assert delta.full_rescan is True, "nothing is known yet, so everything is read"
+        assert delta.scanned_fraction == pytest.approx(1.0, abs=0.01)
+        assert [e.text for e in delta.added] == ["Hello"]
+
+    def test_unchanged_frame_scans_nothing(self, model):
+        model._ocr.items = [("Hello", 100, 100)]
+        img = TaggedImage(frame((640, 480)))
+        model.observe(image=img)
+        calls = model._ocr.calls
+
+        delta = model.observe(image=img)
+        assert delta.regions == []
+        assert delta.changed is False
+        assert model._ocr.calls == calls, "an unchanged screen must not re-OCR"
+
+    def test_elements_persist_across_observations(self, model):
+        model._ocr.items = [("Hello", 100, 100)]
+        img = TaggedImage(frame((640, 480)))
+        model.observe(image=img)
+        model.observe(image=img)
+        assert [e.text for e in model.elements] == ["Hello"]
+
+    def test_new_text_reported_as_added(self, model):
+        base = frame((640, 480))
+        model._ocr.items = [("Hello", 20, 20)]
+        model.observe(image=TaggedImage(base))
+
+        model._ocr.items.append(("World", 300, 300))
+        changed = with_box(base, [300, 300, 340, 312])
+        delta = model.observe(image=TaggedImage(changed))
+
+        assert [e.text for e in delta.added] == ["World"]
+        assert delta.removed == []
+        assert {e.text for e in model.elements} == {"Hello", "World"}
+
+    def test_vanished_text_reported_as_removed(self, model):
+        base = frame((640, 480))
+        model._ocr.items = [("Hello", 20, 20), ("World", 300, 300)]
+        model.observe(image=TaggedImage(base))
+
+        model._ocr.items = [("Hello", 20, 20)]
+        delta = model.observe(image=TaggedImage(with_box(base, [300, 300, 340, 312])))
+
+        assert [e.text for e in delta.removed] == ["World"]
+        assert {e.text for e in model.elements} == {"Hello"}
+
+    def test_untouched_regions_are_not_rescanned(self, model):
+        """The saving only exists if a far-away change leaves the rest alone."""
+        base = frame((1920, 1080))
+        model._ocr.items = [("Hello", 20, 20), ("World", 1700, 1000)]
+        model.observe(image=TaggedImage(base))
+
+        pixels_before = model._ocr.pixels
+        model.observe(image=TaggedImage(with_box(base, [1700, 1000, 1740, 1012])))
+        scanned = model._ocr.pixels - pixels_before
+        assert scanned < 1920 * 1080 * 0.2
+
+    def test_invalidated_elements_are_fully_rescanned(self, model):
+        """
+        Anything dropped must be inside a scanned region.
+
+        Otherwise a dirty rect clipping a text box deletes the element and
+        re-detects only the fragment, silently losing text.
+        """
+        base = frame((1920, 1080))
+        wide = ("A very wide label spanning many tiles", 200, 500)
+        model._ocr.items = [wide]
+        model.observe(image=TaggedImage(base))
+        tracked = model.elements[0]
+
+        # Touch one end of that label only.
+        delta = model.observe(image=TaggedImage(with_box(base, [205, 500, 215, 512])))
+        assert any(
+            r.left <= tracked.region.left and r.right >= tracked.region.right
+            for r in delta.regions
+        ), "region did not grow to cover the element it invalidated"
+
+    def test_find_is_case_insensitive_substring(self, model):
+        model._ocr.items = [("Save As...", 10, 10)]
+        model.observe(image=TaggedImage(frame((640, 480))))
+        assert model.find("save")
+        assert model.find("SAVE AS")
+        assert not model.find("Open")
+
+    def test_find_exact(self, model):
+        model._ocr.items = [("Save As...", 10, 10), ("Save", 10, 100)]
+        model.observe(image=TaggedImage(frame((640, 480))))
+        assert len(model.find("Save")) == 2
+        assert len(model.find("Save", exact=True)) == 1
+
+    def test_reset_clears_state(self, model):
+        model._ocr.items = [("Hello", 10, 10)]
+        img = TaggedImage(frame((640, 480)))
+        model.observe(image=img)
+        model.reset()
+        assert model.elements == []
+        assert model.observe(image=img).regions != []
+
+    def test_efficiency_reports_savings(self, model):
+        base = frame((1920, 1080))
+        model._ocr.items = [("Hello", 20, 20)]
+        model.observe(image=TaggedImage(base))
+        for _ in range(4):
+            model.observe(image=TaggedImage(base))
+        eff = model.efficiency()
+        assert eff["observations"] == 5
+        assert eff["fraction_scanned"] < 0.5
+
+    def test_delta_serialises_without_pixels(self, model):
+        model._ocr.items = [("Hello", 10, 10)]
+        payload = model.observe(image=TaggedImage(frame((640, 480)))).to_dict()
+        assert set(payload) >= {"changed", "added", "removed", "duration_ms"}
+        assert "image" not in payload
+
+
+class TestCascadeRanking:
+    def test_exact_match_outranks_containing_line(self):
+        from oswright.cascade import Candidate, _rank
+
+        line = Candidate("Save the document now", Region(0, 0, 200, 12), "ocr", 0)
+        button = Candidate("Save", Region(0, 50, 40, 62), "ocr", 0)
+        assert _rank([line, button], "Save")[0] is button
+
+    def test_shorter_match_preferred(self):
+        from oswright.cascade import Candidate, _rank
+
+        short = Candidate("Save As", Region(0, 0, 60, 12), "ocr", 0)
+        long = Candidate("Save As A Copy Somewhere", Region(0, 50, 200, 62), "ocr", 0)
+        assert _rank([long, short], "Save")[0] is short
+
+    def test_resolution_reports_failure_clearly(self):
+        from oswright.cascade import Resolution
+
+        payload = Resolution(query="nope").to_dict()
+        assert payload["found"] is False
+        assert "error" in payload
+
+    def test_resolution_reports_rung(self):
+        from oswright.cascade import Candidate, Resolution
+
+        best = Candidate("Save", Region(10, 10, 50, 22), "model", 0)
+        payload = Resolution(
+            query="Save", found=True, best=best, candidates=[best], rung=0
+        ).to_dict()
+        assert payload["rung"] == 0
+        assert (payload["x"], payload["y"]) == (30, 16)
+
+
+class TestCascadeOrder:
+    def test_model_hit_costs_nothing(self, model):
+        from oswright.cascade import resolve
+
+        model._ocr.items = [("Save", 100, 200)]
+        model.observe(image=TaggedImage(frame((640, 480))))
+        calls = model._ocr.calls
+
+        result = resolve("Save", model, allow_uia=False, allow_text_pattern=False)
+        assert result.found
+        assert result.rung == 0
+        assert result.rungs_tried == ["model"]
+        assert model._ocr.calls == calls, "rung 0 must not perceive anything"
+
+    def test_missing_text_walks_the_cascade(self, model):
+        from oswright.cascade import resolve
+
+        model._ocr.items = [("Save", 100, 200)]
+        model.observe(image=TaggedImage(frame((640, 480))))
+
+        result = resolve(
+            "Nonexistent", model,
+            allow_uia=False, allow_text_pattern=False, allow_full_rescan=False,
+        )
+        assert not result.found
+        assert result.rungs_tried == ["model", "incremental"]
