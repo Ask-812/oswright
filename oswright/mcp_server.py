@@ -89,6 +89,13 @@ _settle_tracker = None
 #   both       - the delta plus the image
 _observation_mode: str = "screenshot"
 
+# Which rungs of the resolution cascade may run. Both default to on, which is
+# the whole point of the cascade -- neither pixels nor accessibility wins
+# everywhere. They exist as switches so the claim can be measured against the
+# single-mode alternatives rather than asserted.
+_allow_pixels: bool = True
+_allow_uia: bool = True
+
 # Whether to remember screens across visits and sessions. Enabled by default:
 # a recalled screen is only used after its pixels are spot-checked, so a stale
 # entry is rejected rather than acted on.
@@ -1560,7 +1567,11 @@ def find_element(
     """
     from oswright.cascade import resolve
 
-    return json.dumps(resolve(text, _get_model(), exact=exact, window_title=window_title).to_dict())
+    return json.dumps(resolve(
+        text, _get_model(), exact=exact, window_title=window_title,
+        allow_uia=_allow_uia, allow_text_pattern=_allow_uia,
+        allow_pixels=_allow_pixels,
+    ).to_dict())
 
 
 @mcp.tool(annotations=_INPUT)
@@ -1585,7 +1596,11 @@ def click_element(
     from oswright.cascade import resolve
 
     with _action_lock:
-        result = resolve(text, _get_model(), exact=exact, window_title=window_title)
+        result = resolve(
+            text, _get_model(), exact=exact, window_title=window_title,
+            allow_uia=_allow_uia, allow_text_pattern=_allow_uia,
+            allow_pixels=_allow_pixels,
+        )
         if not result.found:
             return [json.dumps({"action": "click_element", **result.to_dict()})]
 

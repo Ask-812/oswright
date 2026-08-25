@@ -125,6 +125,64 @@ def _rank(candidates: list[Candidate], query: str) -> list[Candidate]:
     return sorted(candidates, key=key)
 
 
+def _window_bounds(window_title: Optional[str]):
+    """
+    The screen rectangle of `window_title`, if it can be resolved.
+
+    Returns (left, top, right, bottom), or None when there is no window to
+    restrict to -- in which case the caller must not filter, since filtering
+    against an unknown rectangle would discard every correct answer.
+    """
+    if not window_title:
+        return None
+    try:
+        from oswright.window import get_window_region
+
+        region = get_window_region(title=window_title)
+    except Exception:  # pragma: no cover - platform dependent
+        logger.debug("Could not resolve window bounds", exc_info=True)
+        return None
+
+    if not region:
+        return None
+    return (
+        region["left"],
+        region["top"],
+        region["left"] + region["width"],
+        region["top"] + region["height"],
+    )
+
+
+def _within(candidates: list[Candidate], bounds) -> list[Candidate]:
+    """
+    Keep only candidates whose centre lies inside `bounds`.
+
+    The pixel rungs read the whole screen, so without this a request to click
+    "Eight" in Calculator can land on the word "Eight" in an unrelated window
+    that happens to be visible. That is not hypothetical: this benchmark's own
+    console output contained the labels it was asking for, and the click went
+    to (1587, 452) -- outside a Calculator window spanning x 767..1185 -- so the
+    sum silently came out wrong.
+
+    `window_title` used to constrain only the accessibility rungs, which was
+    accurate in the docstring and wrong in effect: the caller has named the
+    window it means, and an automation tool acting on a different one is a
+    correctness problem before it is a perception problem.
+    """
+    if bounds is None:
+        return candidates
+
+    left, top, right, bottom = bounds
+    kept = []
+    for candidate in candidates:
+        region = candidate.region
+        cx = region.left + region.width / 2
+        cy = region.top + region.height / 2
+        if left <= cx <= right and top <= cy <= bottom:
+            kept.append(candidate)
+    return kept
+
+
 def _prefers_accessibility(query: str, exact: bool) -> bool:
     """
     Should the accessibility tree be tried before the pixel rungs?
@@ -151,6 +209,7 @@ def resolve(
     allow_uia: bool = True,
     allow_text_pattern: bool = True,
     allow_full_rescan: bool = True,
+    allow_pixels: bool = True,
 ) -> Resolution:
     """
     Locate `query` on screen using the cheapest rung that can answer.
@@ -163,9 +222,17 @@ def resolve(
         allow_uia: Permit the accessibility-tree rung.
         allow_text_pattern: Permit the exact-text rung.
         allow_full_rescan: Permit the final full-screen OCR pass.
+        allow_pixels: Permit every rung that reads pixels. Turning this off
+            leaves only the accessibility rungs, which is the posture other
+            Windows GUI agents take; it exists so that the value of mixing the
+            two can be measured rather than argued.
     """
     started = time.perf_counter()
     result = Resolution(query=query)
+
+    # Resolved once, lazily: the pixel rungs read the whole screen, so every
+    # one of them has to be held to the window the caller named.
+    bounds = _window_bounds(window_title)
 
     def finish(candidates: list[Candidate], rung: int, source: str) -> Resolution:
         ranked = _rank(candidates, query)
@@ -186,10 +253,10 @@ def resolve(
     # previous window. The check costs a fraction of a millisecond, because the
     # compositor is already tracking the answer.
     result.rungs_tried.append("model")
-    if model.is_current():
-        hits = model.find(query, exact=exact)
+    if allow_pixels and model.is_current():
+        hits = _within(_from_elements(model.find(query, exact=exact), 0), bounds)
         if hits:
-            return finish(_from_elements(hits, 0), 0, "model")
+            return finish(hits, 0, "model")
 
     # For targets OCR cannot see at all, go straight to the accessibility tree
     # rather than paying for two pixel passes that are certain to miss.
@@ -200,11 +267,12 @@ def resolve(
 
     # Rung 1 -- refresh only what moved, then look again. This is the common
     # path when the agent has just acted and the target has appeared.
-    result.rungs_tried.append("incremental")
-    model.observe()
-    hits = model.find(query, exact=exact)
-    if hits:
-        return finish(_from_elements(hits, 1), 1, "incremental")
+    if allow_pixels:
+        result.rungs_tried.append("incremental")
+        model.observe()
+        hits = _within(_from_elements(model.find(query, exact=exact), 1), bounds)
+        if hits:
+            return finish(hits, 1, "incremental")
 
     # Rung 2 -- the accessibility tree. Slower than the scan above, but it knows
     # what things *are*: a Button named "Save" rather than pixels reading "Save".
@@ -223,12 +291,12 @@ def resolve(
             return finish(candidates, 3, "uia-text")
 
     # Rung 4 -- give up on being clever and read the whole screen.
-    if allow_full_rescan:
+    if allow_full_rescan and allow_pixels:
         result.rungs_tried.append("full-rescan")
         model.observe(force_full=True)
-        hits = model.find(query, exact=exact)
+        hits = _within(_from_elements(model.find(query, exact=exact), 4), bounds)
         if hits:
-            return finish(_from_elements(hits, 4), 4, "full-rescan")
+            return finish(hits, 4, "full-rescan")
 
     result.duration_ms = (time.perf_counter() - started) * 1000
     return result

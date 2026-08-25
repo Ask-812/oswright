@@ -807,3 +807,95 @@ class TestFuzzyMatching:
         model.observe(image=TaggedImage(frame((640, 480))))
 
         assert [h.text for h in model.find("bravo_notes.txt")] == ["bravo notes.b(t"]
+
+
+class TestSingleModePostures:
+    """
+    The cascade claims neither pixels nor accessibility wins everywhere.
+
+    These switches exist so that claim can be measured against the single-mode
+    alternatives rather than argued, so they need to actually disable a path.
+    """
+
+    def test_pixels_disabled_skips_every_pixel_rung(self, model):
+        from oswright.cascade import resolve
+
+        model._ocr.items = [("Save", 100, 200)]
+        model.observe(image=TaggedImage(frame((640, 480))))
+        calls = model._ocr.calls
+
+        result = resolve(
+            "Save", model, allow_uia=False, allow_text_pattern=False,
+            allow_pixels=False,
+        )
+        assert not result.found, "answered from a pixel rung that was disabled"
+        assert "incremental" not in result.rungs_tried
+        assert "full-rescan" not in result.rungs_tried
+        assert model._ocr.calls == calls, "perceived with pixels disabled"
+
+    def test_pixels_enabled_still_answers(self, model, monkeypatch):
+        from oswright.cascade import resolve
+
+        model._ocr.items = [("Save", 100, 200)]
+        model.observe(image=TaggedImage(frame((640, 480))))
+        monkeypatch.setattr(model, "is_current", lambda: True)
+
+        result = resolve(
+            "Save", model, allow_uia=False, allow_text_pattern=False,
+            allow_pixels=True,
+        )
+        assert result.found
+
+
+class TestWindowScoping:
+    """
+    `window_title` has to constrain the pixel rungs, not just accessibility.
+
+    The pixel rungs read the whole screen. Without scoping, a request to click
+    "Eight" in Calculator can land on the word "Eight" in an unrelated window
+    that happens to be visible -- which is exactly what happened when this
+    benchmark's own console output contained the labels it was asking for.
+    """
+
+    def test_matches_outside_the_named_window_are_discarded(self, model, monkeypatch):
+        import oswright.cascade as C
+
+        model._ocr.items = [("Eight", 1587, 452)]
+        model.observe(image=TaggedImage(frame((1920, 1080))))
+        monkeypatch.setattr(model, "is_current", lambda: True)
+        monkeypatch.setattr(C, "_window_bounds", lambda title: (767, 297, 1185, 972))
+
+        result = C.resolve(
+            "Eight", model, window_title="Calculator",
+            allow_uia=False, allow_text_pattern=False, allow_full_rescan=False,
+        )
+        assert not result.found, "clicked text belonging to another window"
+
+    def test_matches_inside_the_named_window_are_kept(self, model, monkeypatch):
+        import oswright.cascade as C
+
+        model._ocr.items = [("Eight", 976, 796)]
+        model.observe(image=TaggedImage(frame((1920, 1080))))
+        monkeypatch.setattr(model, "is_current", lambda: True)
+        monkeypatch.setattr(C, "_window_bounds", lambda title: (767, 297, 1185, 972))
+
+        result = C.resolve(
+            "Eight", model, window_title="Calculator",
+            allow_uia=False, allow_text_pattern=False, allow_full_rescan=False,
+        )
+        assert result.found
+        assert result.rung == 0
+
+    def test_no_window_named_means_no_filtering(self, model, monkeypatch):
+        """Filtering against an unknown rectangle would discard every answer."""
+        import oswright.cascade as C
+
+        model._ocr.items = [("Eight", 1587, 452)]
+        model.observe(image=TaggedImage(frame((1920, 1080))))
+        monkeypatch.setattr(model, "is_current", lambda: True)
+
+        result = C.resolve(
+            "Eight", model,
+            allow_uia=False, allow_text_pattern=False, allow_full_rescan=False,
+        )
+        assert result.found
