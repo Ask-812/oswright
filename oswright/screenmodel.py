@@ -181,6 +181,18 @@ class ScreenModel:
 
     # --- observation ---
 
+    def adopt(self, elements: list[Element], image: Image.Image):
+        """
+        Take a known set of elements as the current state of the screen.
+
+        Used when a screen has been recognised or predicted rather than read.
+        The change baseline is reset to this frame so the next observation
+        reports only what moves from here.
+        """
+        self._elements = list(elements)
+        self._tracker.update(image)
+        self._last_total_pixels = image.width * image.height
+
     def warm_start(self, image: Optional[Image.Image] = None) -> bool:
         """
         Seed the model from the atlas instead of reading the whole screen.

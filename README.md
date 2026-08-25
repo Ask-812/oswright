@@ -17,9 +17,11 @@ A Model Context Protocol (MCP) server that provides **OS-level desktop automatio
 - **43 MCP tools.** Screen, OCR, UIA, mouse, keyboard, windows, clipboard, and compound actions.
 - **Incremental perception.** Rescans only the parts of the screen that changed, and can return what changed instead of a full screenshot — ~21× fewer tokens per step.
 - **Screen memory.** Recognises screens it has read before and reuses them, verified by pixels — 89× cheaper than reading again.
+- **Speculative perception.** Learns what actions do and confirms the expected result instead of re-reading — 19–23× cheaper, with a `surprise` report when the interface does something unexpected.
+- **Adaptive waiting.** Waits for the screen to actually settle rather than sleeping a fixed 300 ms — 11.9 s saved over a 50-step task.
 - **Resolution cascade.** Element lookups stop at the cheapest method that works; repeat lookups cost ~0.05 ms.
 - **DPI-correct.** Coordinates are physical pixels everywhere, so clicks land correctly on scaled displays.
-- **Test suite.** 180 automated tests; the desktop-driving ones skip themselves when no display is available.
+- **Test suite.** 213 automated tests; the desktop-driving ones skip themselves when no display is available.
 
 ### Requirements
 
@@ -258,6 +260,7 @@ OSWright MCP server supports the following arguments. They can be provided in th
 | `--snapshot-max-width <px>` | Downscale the auto-snapshot returned after each action. `0` (default) keeps full resolution. Lower values cut token cost significantly. | `OSWRIGHT_SNAPSHOT_MAX_WIDTH` |
 | `--observation-mode <mode>` | What action tools return: `screenshot` (default), `delta` (only what changed, ~30× fewer tokens), or `both`. | `OSWRIGHT_OBSERVATION_MODE` |
 | `--no-atlas` | Do not remember screens across visits. | `OSWRIGHT_NO_ATLAS` |
+| `--no-speculate` | Do not predict the outcome of actions. | `OSWRIGHT_NO_SPECULATE` |
 | `--allow-remote` | Required to bind a non-loopback address. See [Security](#security). | |
 | `--log-level <level>` | Logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR`. Default: `INFO`. | `OSWRIGHT_LOG_LEVEL` |
 
@@ -569,6 +572,8 @@ oswright/
   screenmodel.py       # Persistent screen model, updated incrementally
   cascade.py           # Resolution cascade - cheapest method that can answer
   atlas.py             # Remembers screens across visits and sessions
+  settle.py            # Knowing when the screen has finished responding
+  speculate.py         # Predicting what an action does, instead of looking
   textprovider.py      # Exact text from the app itself via UIA TextPattern
   detect.py            # OCR dispatcher with caching (auto-selects best backend)
   _ocr_windows.py      # Windows OCR backend (instant, built-in)
@@ -587,6 +592,7 @@ tests/
   test_core.py         # Unit tests (no desktop required)
   test_perception.py   # Incremental perception (stubbed, runs headless)
   test_atlas.py        # Screen memory and its failure modes (headless)
+  test_speculate.py    # Prediction, settling, and their limits (headless)
   test_e2e.py          # End-to-end tests against the real desktop (marked `e2e`)
 ```
 
@@ -603,13 +609,50 @@ with nothing checkable is not remembered at all.
 
 Disable with `--no-atlas`. Remembered screens live in `~/.oswright/atlas.json`.
 
+### Predicting actions instead of observing them
+
+Applications are deterministic — clicking Save produces the same dialog every
+time — so after the first observation the outcome of an action is already known.
+OSWright learns what actions do and *confirms* the expected screen rather than
+reading it again: **19–23× cheaper than observing** (2.3 ms versus 43–50 ms).
+
+A prediction has to be seen twice before it is trusted, is retired if it proves
+wrong, and is checked the same two ways a remembered screen is. A failed
+prediction is reported to the agent as a `surprise` — the interface did
+something it does not normally do, which is worth knowing rather than silently
+absorbing.
+
+**What a confirmed prediction guarantees:** the layout — the same controls in
+the same places. Not that every character is identical. A single changed digit
+alters fewer pixels than a blinking caret, so no whole-screen check can separate
+them at any resolution. Use `observe(force_full=True)` when exact text matters.
+
+Disable with `--no-speculate`.
+
+### Waiting only as long as needed
+
+Action tools used to sleep a fixed 300 ms, chosen for the slowest case, so every
+action paid the worst case. The compositor knows when the screen stops changing,
+so the wait now ends when the interface actually settles:
+
+| | |
+|---|---|
+| Previous fixed sleep | 300 ms |
+| Median actual wait | **61.5 ms** |
+| Saved over a 50-step task | **11.9 s** |
+
+"Settled" means no *large* change recently, not no change: a real desktop is
+never still — a caret and a clock produce a change event every ~18 ms covering
+about 32 pixels, while genuine UI changes cover tens of thousands.
+
 ### Not done yet
 
-- **Speculative perception.** With both the atlas and the change oracle in
-  place, an agent could predict the post-action screen and verify the prediction
-  rather than re-perceiving. Correct predictions would cost nothing.
 - **Wayland input injection**, and macOS `AXTextMarker` as a TextPattern
   equivalent.
+- **A vision-model rung** for surfaces that are neither accessible nor
+  text-legible: games, canvases, image editors.
+- **Transitions keyed on more than the previous screen**, for actions whose
+  outcome depends on state that is not visible.
 
 ## Development
 

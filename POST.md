@@ -65,6 +65,65 @@ Works with Claude Desktop, VS Code, Cursor, Windsurf, Cline, Goose, and any MCP 
 
 ## Version History
 
+### v0.7.0 — Not looking at all
+
+Perception had been made cheap. This release makes it unnecessary — and starts
+with a finding that reframed the whole loop.
+
+**The largest cost was not perception. It was sleeping.** Every action tool
+ended with `time.sleep(0.3)`, a fixed wait chosen for the slowest case, so every
+action paid the worst case. With perception down to ~45 ms, that sleep was six
+times the cost of the work around it. The compositor knows when the screen stops
+changing, so the wait now ends when the interface actually settles:
+
+```
+fixed sleep previously used per action : 300.0 ms
+median actual wait                     :  61.5 ms
+saved per action                       : 238.5 ms   -> 11.9s over 50 steps
+```
+
+Defining "settled" needed a correction. The first version waited for *no* change
+and timed out on every single sample, because a real desktop is never still: a
+blinking caret and a ticking clock produce a change event roughly every 18 ms,
+covering about 32 pixels. Genuine UI changes cover tens of thousands. The
+criterion is "nothing *large* recently".
+
+**And a known action does not need observing at all.** Applications are
+deterministic, so after the first observation the outcome is already known;
+confirming the expected screen is **19–23× cheaper than reading it** (2.3 ms
+versus 43–50 ms). This is speculative execution applied to perception, and it
+needed no new machinery: the atlas confirms a screen by pixels, the compositor
+says when to look. What it added was a transition model — `(screen, action) →
+outcome`, learned by watching.
+
+Three safeguards, each from a failure a test found: a transition must be seen
+twice before it is trusted; one that proves wrong is retired; and prediction
+re-checks the layout, not just the sampled regions — the first version skipped
+that check, so a change outside every sample went unnoticed.
+
+**A limit that cannot be engineered away.** Verification proves the layout is
+the one expected. It does not prove every character is identical, and it cannot.
+A single changed digit alters *fewer* pixels than a blinking caret:
+
+| Whole-screen grid | a caret appears | a digit changes |
+|---|---|---|
+| 64×36 | 0.00043 | 0.00000 |
+| 256×144 | 0.00022 | 0.00000 |
+| 320×180 | 0.00017 | 0.00003 |
+
+The signal is inverted at every resolution tried. Several iterations went into
+trying to tune out of it before accepting it was structural. So the guarantee is
+stated for what it is — a confirmed prediction means the screen is safe to act
+on, not that a clock or a counter is current — and a test pins the limitation
+rather than hiding it.
+
+A failed prediction is reported as a `surprise`: the interface did something it
+does not normally do, which is worth telling the agent rather than silently
+absorbing as a cache miss.
+
+New: `settle.py`, `speculate.py`, `--no-speculate`,
+`benchmarks/bench_settle.py`, `benchmarks/bench_speculate.py`, 33 new tests.
+
 ### v0.6.0 — Screens the agent remembers
 
 Applications are deterministic. The Save dialog looks the same every time it
