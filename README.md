@@ -698,12 +698,35 @@ reproducible via `benchmarks/` — across four applications, cheaper perception
 does not cost accuracy, and the pixel/accessibility split is measured rather
 than argued.
 
-What is *not* established is a head-to-head against other GUI agents. Four
-applications on one Windows 11 laptop is a corpus, not a survey; it says nothing
-about how oswright compares to Windows-MCP or any other agent on real work, and
-nothing about long multi-step tasks. "Cheaper, with no accuracy loss on these
-tasks, and correct where single-mode designs are blind" is the claim. "Better
-agent" is not.
+### Against Windows-MCP
+
+Same task, same four buttons, graded by Calculator's own UI Automation. Neither
+tool grades itself, and [Windows-MCP](https://github.com/CursorTouch/Windows-MCP)
+runs with its own defaults:
+
+| | passed | tokens | steps | seconds |
+|---|---|---|---|---|
+| oswright | 3/3 | **419** | 4 | **2.7** |
+| Windows-MCP, snapshot per action | 3/3 | 8,048 | 8 | 5.6 |
+| Windows-MCP, snapshot once | 3/3 | 2,033 | 5 | 4.2 |
+
+The difference is structural rather than a tuning win. Windows-MCP returns the
+screen to the agent and takes coordinates back, so a description of the screen
+is charged to the model's context on every action. oswright takes the text and
+returns the outcome.
+
+Both configurations are shown because reporting only the unflattering one would
+be an advertisement. Note that snapshotting once is safe *here* only because
+Calculator does not move between clicks.
+
+Reproduce with `python benchmarks/bench_head_to_head.py` (setup in the file's
+docstring).
+
+**What this does not establish:** one task, one application, one laptop. It says
+nothing about robustness across a wide corpus or long multi-step work, and
+nothing about product maturity — Windows-MCP has OAuth, analytics, a watchdog
+and an installer; oswright has none of those. "Cheaper per action, correct where
+single-mode designs are blind" is the claim. "Better product" is not.
 
 ## Development
 

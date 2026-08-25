@@ -834,6 +834,67 @@ this one is over-engineered.
 
 ---
 
+### 2.17 The comparison I had been avoiding
+
+Asked directly whether oswright was better than Windows-MCP, the honest answer
+for six versions was *no idea* — every benchmark compared oswright to earlier
+versions of itself. That is the comparison that flatters, and it is not the one
+a person choosing a tool cares about.
+
+The gate was set before starting: **can Windows-MCP be driven tool-by-tool,
+without an LLM and without credentials?** If not, abandon — a comparison that
+cannot be reproduced from a script is not evidence. It passed: it requires
+Python 3.14 (installed alongside, not over, the existing interpreter), auth is
+optional and applies only to HTTP, and over stdio it exposes 20 tools.
+
+Reading its tool schemas showed the two designs differ **mechanically**, not by
+tuning:
+
+- **Windows-MCP** returns the screen to the agent — `Snapshot` renders the
+  accessibility tree as `(x,y) button "Seven" [action: click]` — and takes
+  coordinates back through `Click`. The description of the screen is charged to
+  the model's context on every action.
+- **oswright** takes the text and returns the outcome: `click_element(text=
+  "Seven")` resolves internally through the cascade.
+
+Both were run on the same task, the same four buttons, graded by Calculator's
+own UI Automation display. Neither tool grades itself. Windows-MCP ran with its
+own defaults, and I measured **its best case as well as its prescribed one**,
+because a comparison that only reports the unflattering configuration is an
+advertisement.
+
+| | passed | tokens | steps | seconds |
+|---|---|---|---|---|
+| oswright | 3/3 | **419** | 4 | **2.7** |
+| Windows-MCP, snapshot per action | 3/3 | 8,048 | 8 | 5.6 |
+| Windows-MCP, snapshot once | 3/3 | 2,033 | 5 | 4.2 |
+
+**19.2× less context than its documented loop, 4.9× than its cheapest possible
+use, at half the wall-clock, with both tools correct.**
+
+Two things make that honest rather than triumphant. Snapshotting once is only
+safe because Calculator does not move between clicks — an agent that assumes
+that in general is acting on stale coordinates, which is exactly the
+unsoundness oswright had at rung 0 and had to fix, so the 4.9× is measured
+against a configuration that is not generally safe. And this is one task on one
+application: it says nothing about robustness across a corpus, nor about the
+product surface Windows-MCP has and oswright does not.
+
+**The mistake worth recording.** The first run reported Windows-MCP failing with
+the display showing `9,999`. I had passed `label=N` to `Click`, having read the
+schema and not the output format — their labels are for annotated screenshots,
+while the default tree gives coordinates. My adapter drove the wrong buttons and
+the harness recorded it as *their* defect.
+
+It was caught because `9,999` is not a plausible result of pressing 7 × 8, and
+because a fairness rule written down before the run said their failures had to
+be reported — which made me look at one instead of accepting it. **When you
+build the apparatus that measures your competitor, every bug in it defaults to
+their disadvantage.** That asymmetry does not announce itself; the only defence
+is deciding in advance what a fair run looks like.
+
+---
+
 ## Part 3 — Results
 
 Measured over a 14-step agent loop at 1920×1080:
@@ -944,6 +1005,11 @@ Worth knowing, because these are the questions an interviewer will ask.
     an entropy threshold; measuring first showed those regions score 31–62
     standard deviation, nowhere near uniform. The hypothesis was wrong and the
     measurement took four minutes.
+26. **Drove a competitor's tool wrong and nearly published it as their defect.**
+    I passed `label=N` to Windows-MCP's `Click` after reading its schema and not
+    its output; it clicked the wrong buttons and the harness recorded `9,999` as
+    a Windows-MCP failure (§2.17). When you build the apparatus that measures
+    someone else's tool, every bug in it defaults to their disadvantage.
 
 Approaches investigated and rejected on evidence:
 

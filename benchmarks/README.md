@@ -201,3 +201,59 @@ Findings from building it, which are worth as much as the tables:
   reasoning from a screenshot asks for the wrong string, and no amount of
   perception engineering fixes that — it needs a synonym layer or an agent told
   to use accessible names.
+
+
+## `bench_head_to_head.py` ? against Windows-MCP
+
+Every other benchmark here compares oswright to earlier versions of itself,
+which cannot answer the only question a person choosing a tool asks.
+
+Same task, same four buttons, graded by Calculator's own UI Automation. Neither
+tool grades itself. Windows-MCP runs with its own defaults.
+
+| | passed | tokens | steps | seconds |
+|---|---|---|---|---|
+| oswright | 3/3 | **419** | 4 | **2.7** |
+| Windows-MCP, snapshot per action | 3/3 | 8,048 | 8 | 5.6 |
+| Windows-MCP, snapshot once | 3/3 | 2,033 | 5 | 4.2 |
+
+The difference is mechanical, not a matter of tuning. Windows-MCP returns the
+screen to the agent ? `Snapshot` renders the accessibility tree as
+`(x,y) button "Seven" [action: click]` ? and takes coordinates back through
+`Click`, so the description of the screen is charged to the model's context on
+every action. oswright takes the text and returns the outcome.
+
+Both of its configurations are reported. Snapshotting once is the cheapest
+possible use of the tool and is safe *here* only because Calculator does not
+move between clicks; an agent that assumes that in general acts on stale
+coordinates.
+
+**Setup** (Windows-MCP needs Python 3.14; `uv` installs it alongside, not over,
+your existing interpreter):
+
+```
+uv python install 3.14
+git clone https://github.com/CursorTouch/Windows-MCP.git %TEMP%/Windows-MCP
+cd %TEMP%/Windows-MCP
+uv venv --python 3.14 .venv
+uv pip install --python .venv/Scripts/python.exe -e .
+```
+
+Check the connection first with `python benchmarks/probe_windows_mcp.py`, which
+lists their tool surface and confirms stdio needs no credentials.
+
+**Fairness rules, fixed before the first run:** same application and buttons;
+graded by the application, not by either tool; identical token accounting;
+Windows-MCP at its own defaults and not crippled; failures on either side
+reported.
+
+That last rule earned its place immediately. The first run recorded Windows-MCP
+failing with the display showing `9,999` ? because I had passed `label=N` to
+`Click`, having read its schema and not its output format. Their labels are for
+annotated screenshots; the default tree gives coordinates. My adapter drove the
+wrong buttons and the harness blamed them. When you build the apparatus that
+measures a competitor, every bug in it defaults to their disadvantage.
+
+**What this does not establish:** one task, one application, one laptop. Nothing
+about robustness across a corpus, long multi-step work, or the product surface
+Windows-MCP has and oswright does not.
