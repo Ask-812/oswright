@@ -418,14 +418,26 @@ class TestOCREngine:
 
     def test_backend_selection(self):
         from oswright.detect import _OCR_BACKEND, _OCR_BACKENDS
-        assert len(_OCR_BACKENDS) > 0
+
+        if not _OCR_BACKENDS:
+            pytest.skip("no OCR backend installed on this machine")
         assert _OCR_BACKEND is not None
         assert _OCR_BACKEND in _OCR_BACKENDS
 
     def test_engine_creates(self):
-        from oswright.detect import OCREngine
+        from oswright.detect import _OCR_BACKENDS, OCREngine
+
+        if not _OCR_BACKENDS:
+            pytest.skip("no OCR backend installed on this machine")
         engine = OCREngine()
         assert engine.backend_name in ("winocr", "easyocr")
+
+    def test_missing_backend_explains_itself(self):
+        """With no backend at all, the error must say how to get one."""
+        from oswright.detect import _no_backend_message
+
+        message = _no_backend_message()
+        assert "pip install" in message
 
     def test_easyocr_not_imported_at_module_scope(self):
         """Importing easyocr pulls in torch and costs seconds of startup."""

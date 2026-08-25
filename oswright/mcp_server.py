@@ -81,6 +81,11 @@ _model_lock = threading.Lock()
 #   delta      - only what changed since the last observation
 #   both       - the delta plus the image
 _observation_mode: str = "screenshot"
+
+# Whether to remember screens across visits and sessions. Enabled by default:
+# a recalled screen is only used after its pixels are spot-checked, so a stale
+# entry is rejected rather than acted on.
+_atlas_enabled: bool = True
 _ocr_languages: list[str] = ["en"]
 _default_timeout: float = 10.0
 _default_poll_interval: float = 0.5
@@ -203,7 +208,14 @@ def _get_model():
         if _model is None:
             from oswright.screenmodel import ScreenModel
 
-            _model = ScreenModel(_get_capture(), _get_ocr())
+            atlas = None
+            if _atlas_enabled:
+                from oswright.atlas import UIAtlas
+
+                atlas = UIAtlas()
+                logger.info("Screen atlas loaded: %d remembered screens", len(atlas))
+
+            _model = ScreenModel(_get_capture(), _get_ocr(), atlas=atlas)
         return _model
 
 
@@ -1316,14 +1328,54 @@ def observe(force_full: bool = False) -> str:
     Prefer this over `screenshot` for tracking state. It maintains a running
     model of on-screen text and rescans only the regions that actually moved,
     so it costs a fraction of a full screen read and returns tens of tokens
-    instead of thousands. The first call scans everything.
+    instead of thousands.
+
+    The first call on an unfamiliar screen reads everything. If the screen has
+    been seen before it is recognised and reused instead, after spot-checking
+    that it really is the same screen.
 
     Args:
         force_full: Rescan the entire screen instead of only what changed.
                     Use if you suspect the model has drifted.
     """
-    delta = _get_model().observe(force_full=force_full)
-    return json.dumps(delta.to_dict())
+    model = _get_model()
+    warm = False
+    if not force_full and not model.elements:
+        warm = model.warm_start()
+
+    delta = model.observe(force_full=force_full)
+    payload = delta.to_dict()
+    payload["warm_start"] = warm
+    return json.dumps(payload)
+
+
+@mcp.tool(annotations=_READONLY)
+def remember_screen() -> str:
+    """
+    Remember the current screen so future visits skip reading it.
+
+    Useful after arriving at a screen you expect to return to, such as a
+    settings page or a dialog. Remembered screens persist across sessions and
+    are always spot-checked before being reused.
+    """
+    model = _get_model()
+    if not model.elements:
+        model.observe()
+    stored = model.remember()
+    return json.dumps({
+        "remembered": stored,
+        "elements": len(model.elements),
+        **({"reason": "atlas disabled"} if not _atlas_enabled else {}),
+    })
+
+
+@mcp.tool(annotations=_READONLY)
+def atlas_stats() -> str:
+    """Report what the screen atlas has remembered and how often it helped."""
+    model = _get_model()
+    if model._atlas is None:
+        return json.dumps({"enabled": False})
+    return json.dumps({"enabled": True, **model._atlas.summary()})
 
 
 @mcp.tool(annotations=_READONLY)
@@ -1639,7 +1691,8 @@ def wait_for_change(
 
 def main():
     """Run the OSWright MCP server."""
-    global _ocr_languages, _default_timeout, _snapshot_max_width, _observation_mode
+    global _ocr_languages, _default_timeout, _snapshot_max_width
+    global _observation_mode, _atlas_enabled
 
     parser = argparse.ArgumentParser(
         prog="oswright",
@@ -1682,6 +1735,14 @@ def main():
             "'screenshot' (default) returns a full image, costing ~2800 image "
             "tokens per action. 'delta' returns only the text that appeared or "
             "disappeared, typically a few dozen tokens. 'both' returns each."
+        ),
+    )
+    parser.add_argument(
+        "--no-atlas", action="store_true",
+        help=(
+            "Do not remember screens across visits. By default OSWright caches "
+            "the layout of screens it has read, and reuses one only after "
+            "spot-checking that the screen really is unchanged."
         ),
     )
     parser.add_argument(
@@ -1729,6 +1790,10 @@ def main():
     ).lower()
     if _observation_mode not in ("screenshot", "delta", "both"):
         parser.error(f"Invalid observation mode: {_observation_mode!r}")
+
+    _atlas_enabled = not (
+        args.no_atlas or os.environ.get("OSWRIGHT_NO_ATLAS", "").strip()
+    )
 
     log_level = (
         args.log_level

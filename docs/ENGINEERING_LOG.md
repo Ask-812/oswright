@@ -360,6 +360,86 @@ This is why ratios are reported from within a single run rather than mixing
 absolute numbers across runs, and why `benchmarks/` exists: re-measure rather
 than trusting these figures.
 
+### 2.9 Remembering screens between visits
+
+Applications are deterministic. The Save dialog looks the same every time it
+opens. Yet the agent re-read all of it on every visit, and again in the next
+session, because nothing remembered what was learned.
+
+The atlas stores a screen's layout, keyed by a structural signature, and reuses
+it on the next visit: **125 ms cold read → 1.4 ms warm recall, 89× cheaper**,
+with a 5/5 hit rate on a live desktop and correct rejection of blank, inverted
+and wrong-application screens.
+
+The design splits into two parts doing different jobs:
+
+- **The signature decides which remembered screen might apply.** It is a
+  downsampled edge map, capturing *arrangement* rather than content. Measured on
+  a live desktop: an idle screen drifts 0.0000 between frames, while a
+  structurally different image sits at 0.379. Huge separation, so the tolerance
+  is not delicate.
+- **Verification decides whether it actually does.** Because at 48×27 two
+  screens with the same arrangement but different words look identical — which
+  is not a defect, it is the division of labour.
+
+**Two failed approaches, both instructive.**
+
+*Verifying by re-reading text does not work.* The obvious design is to OCR a few
+remembered elements and compare strings. It fails, because **OCR output is not a
+stable identity**. Segmentation depends on the crop it is given (§2.3:
+full-frame and crop OCR agree only ~91%), and small on-screen text is often
+garbled — real stored labels from this machine included `'Elevatc'`, `'Con tir'`
+and `'Subarr&'`. Comparing one garbling against a differently-cropped garbling
+rejected screens that were perfectly intact. Worse, tight crops around small
+text returned *nothing at all* until padded past 64 px.
+
+The fix was to stop asking what a region says and ask whether it still looks the
+same. Comparing pixels costs no OCR, cannot be confused by segmentation, and is
+exact.
+
+*Mean absolute difference is the wrong metric for that comparison.* A small
+piece of text in a mostly-blank region barely moves the mean, so a changed
+heading in a wide box scored 1.47 against 0.00 for an identical one — far too
+close to threshold safely. Counting *how many cells changed* is not diluted by
+the blank area around the change:
+
+| Case | mean | cells changed |
+|---|---|---|
+| identical | 0.00 | **0.000** |
+| noise elsewhere on screen | 0.00 | **0.000** |
+| heading changed (wide box) | 1.47 | **0.020** |
+| heading changed (tight box) | 12.79 | **0.180** |
+| a row moved 25 px | 30.76 | **0.310** |
+
+That table also shows why verifier regions are capped in width: a tight box
+around the change scores nine times higher than a full-width one.
+
+**Failing closed.** A stale layout that gets used is the worst outcome this
+system can produce — the agent clicks somewhere arbitrary. So every unexpected
+condition is a rejection: no verifiers, a region that no longer fits on screen,
+a comparison that cannot be made. A screen with nothing verifiable is *not
+remembered at all*, since it could only ever be trusted blindly. A failed recall
+costs one signature plus a few tiny image comparisons — negligible against the
+full read it was trying to avoid.
+
+### 2.10 CI caught the bug I had just fixed
+
+The first run of the test workflow failed on Linux with
+`ModuleNotFoundError: No module named 'mcp.server.fastmcp'` — precisely the
+breakage §1.1 exists to prevent.
+
+The cause: to keep CI fast, the Linux job installs with `pip install -e .
+--no-deps` and then lists the light dependencies by hand. `--no-deps` means
+`pyproject.toml`'s `mcp[cli]>=1.0,<2` is never applied, and the hand-written
+list said `"mcp[cli]"` with no bound. The constraint existed, was correct, and
+was bypassed by the very pipeline meant to verify it.
+
+Worth remembering as a general shape: **a constraint expressed in one place and
+re-stated in another will drift**, and the re-statement is usually in
+infrastructure nobody re-reads. The same run also showed two OCR tests asserting
+that a backend exists, which is false by construction on a runner where OCR is
+deliberately not installed; they now skip.
+
 ### 2.6 The resolution cascade
 
 Element lookup tries rungs in increasing cost order and stops at the first that
@@ -429,6 +509,16 @@ Worth knowing, because these are the questions an interviewer will ask.
    chance of perturbing generated schemas, for zero functional gain. Rule
    disabled with a written reason rather than silently ignored.
 
+7. **Tried to verify a cached screen by re-reading its text.** OCR output is not
+   a stable identity — its segmentation depends on the crop, and small text
+   comes back garbled differently each time (§2.9). Verification had to move
+   from "what does this say?" to "does this still look the same?".
+8. **Used a mean absolute difference to compare regions.** It dilutes a small
+   real change across a large blank area (§2.9). Counting changed cells does
+   not.
+9. **Let CI bypass a dependency constraint** by re-stating it without the bound
+   (§2.10). The pin was right; the pipeline verifying it was not.
+
 Approaches investigated and rejected on evidence:
 
 - **Hooking DirectWrite/GDI to recover text from the render path.** This is
@@ -447,12 +537,8 @@ Approaches investigated and rejected on evidence:
 
 ## Part 5 — What is deliberately not done
 
-- **Per-application UI atlas.** Applications are deterministic: the same dialog
-  has the same layout every time. Caching layouts across sessions, keyed by a
-  content-addressed fingerprint, would make repeat visits nearly free. Not in
-  the literature.
-- **Speculative perception.** With an atlas and a cheap change oracle (which
-  now exists, §2.5), an agent could predict the post-action screen state and
+- **Speculative perception.** With the atlas (§2.9) and the change oracle
+  (§2.5) both in place, an agent could predict the post-action screen state and
   verify the prediction rather than re-perceiving. Correct predictions would
   cost nothing. This is predictive coding applied to GUI agents; the premise
   (change is sparse) is measured, the transition model is not built.
@@ -478,10 +564,12 @@ Approaches investigated and rejected on evidence:
   rung, which is not implemented.
 - *Why is TextPattern below OCR in the cascade if it is exact?* — §2.6.
   Ordering is by "try first", not by quality.
+- *How do you know a cached screen is still valid?* — §2.9. Pixels, not text,
+  and it fails closed. Bring the table showing why mean difference was the wrong
+  metric.
 - *What is the single biggest remaining cost?* — OCR of the changed regions,
-  now that capture goes through the GPU path. Beyond that, the next structural
-  win is not making perception faster but making it unnecessary: a per-app
-  atlas plus speculative verification (Part 5).
+  now that capture goes through the GPU path and known screens are recalled.
+  Beyond that the next structural win is speculative verification (Part 5).
 - *Your numbers vary by 3× between runs — why should I believe them?* — §2.8.
   Because they are ratios measured within a run, and because `benchmarks/` is
   in the repository so you can re-measure.

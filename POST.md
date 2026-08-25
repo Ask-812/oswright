@@ -65,6 +65,55 @@ Works with Claude Desktop, VS Code, Cursor, Windsurf, Cline, Goose, and any MCP 
 
 ## Version History
 
+### v0.6.0 — Screens the agent remembers
+
+Applications are deterministic. The Save dialog looks the same every time it
+opens. Yet the agent re-read all of it on every visit, and again in the next
+session, because nothing remembered what it had learned.
+
+OSWright now remembers screens and reuses them: **125 ms cold read → 1.4 ms
+warm recall, 89× cheaper**, persisted across sessions, with a 5/5 hit rate on a
+live desktop.
+
+A remembered screen is never trusted on recognition alone, because a stale
+layout that gets used is the worst thing this system can do — the agent clicks
+somewhere arbitrary. Recognition and verification are separate jobs:
+
+- A **layout signature** (a downsampled edge map) decides which remembered
+  screen might apply. On a live desktop an idle screen drifts 0.0000 between
+  frames while a structurally different image sits at 0.379 — an enormous gap.
+- **Pixel spot-checks** decide whether it actually does, because at that
+  resolution two screens with the same arrangement but different words look
+  identical.
+
+Two failed approaches worth recording, both now in the engineering log.
+
+**Verifying by re-reading text does not work.** The obvious design — OCR a few
+remembered elements, compare the strings — fails because OCR output is not a
+stable identity. Segmentation depends on the crop, and small text comes back
+garbled: real stored labels here included `'Elevatc'`, `'Con tir'` and
+`'Subarr&'`. Comparing one garbling against a differently-cropped garbling
+rejected screens that were perfectly intact, and tight crops returned nothing at
+all until padded past 64 px. The fix was to stop asking what a region says and
+ask whether it still looks the same.
+
+**Mean absolute difference is the wrong way to compare those pixels.** A small
+change inside a mostly-blank region barely moves the mean: a changed heading
+scored 1.47 against 0.00 for an identical one. Counting *how many cells changed*
+is not diluted by the blank area — 0.000 identical versus 0.020–0.310 changed.
+
+Everything fails closed. No verifiable regions means the screen is not
+remembered at all, since it could only ever be trusted blindly.
+
+New tools: `remember_screen`, `atlas_stats`. `observe` now warm-starts
+automatically. Disable with `--no-atlas`.
+
+Also: the first CI run failed with `No module named 'mcp.server.fastmcp'` — the
+exact breakage v0.4.0 fixed. The Linux job installs with `--no-deps` and
+re-listed the dependencies by hand without the `<2` bound. The constraint was
+right; the pipeline verifying it was not. A constraint stated in two places will
+drift, and the copy usually lives in infrastructure nobody re-reads.
+
 ### v0.5.2 — Capture from the GPU
 
 v0.5.1 acquires a compositor frame to learn what changed, then threw those
