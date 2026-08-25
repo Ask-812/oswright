@@ -14,9 +14,11 @@ A Model Context Protocol (MCP) server that provides **OS-level desktop automatio
 - **Clipboard access.** Read and write system clipboard for data transfer.
 - **App launcher.** Launch applications and wait for them to load.
 - **Auto-snapshot.** Every action returns a screenshot so the agent always sees current state.
-- **36 MCP tools.** Screen, OCR, UIA, mouse, keyboard, windows, clipboard, and compound actions.
+- **41 MCP tools.** Screen, OCR, UIA, mouse, keyboard, windows, clipboard, and compound actions.
+- **Incremental perception.** Rescans only the parts of the screen that changed, and can return what changed instead of a full screenshot — ~21× fewer tokens per step.
+- **Resolution cascade.** Element lookups stop at the cheapest method that works; repeat lookups cost ~0.05 ms.
 - **DPI-correct.** Coordinates are physical pixels everywhere, so clicks land correctly on scaled displays.
-- **Test suite.** 91 automated tests; the desktop-driving ones skip themselves when no display is available.
+- **Test suite.** 132 automated tests; the desktop-driving ones skip themselves when no display is available.
 
 ### Requirements
 
@@ -154,6 +156,66 @@ python -m oswright
 
 </details>
 
+## Incremental perception
+
+Most GUI agents re-perceive the entire screen on every step: full screenshot,
+full OCR, then hand the model a fresh image. Measured on a live desktop, the
+median observation changes **0.012% of pixels** — so a full rescan does roughly
+240× more work than the change warrants, and the screenshot it returns costs
+~2,800 image tokens whether anything happened or not.
+
+OSWright keeps a model of the screen between observations and rescans only the
+regions that actually moved.
+
+```
+observe()  ->  {"changed": true,
+                "added":   [{"text": "Saved", "x": 812, "y": 447}],
+                "removed": ["Unsaved changes"],
+                "screen_fraction_scanned": 0.015}
+```
+
+Measured on this machine over a 14-step agent loop:
+
+| | v0.4.0 (full OCR + screenshot) | incremental |
+|---|---|---|
+| Median latency per step | 185 ms | **71 ms** |
+| Tokens per observation | ~2,764 | **~84** |
+| Tokens over 14 steps | 38,696 | **1,800** |
+| Screen re-read | 100% | **11.5%** |
+
+### The resolution cascade
+
+`find_element` and `click_element` stop at the first method that can answer,
+so cost tracks how *novel* the request is rather than how large the screen is:
+
+| Rung | Method | Typical cost |
+|---|---|---|
+| 0 | Already in the screen model | **~0.05 ms** |
+| 1 | Rescan only what changed | ~70 ms |
+| 2 | Accessibility tree (knows a Button *is* a button) | ~40 ms |
+| 3 | App's own text buffer via UIA TextPattern — exact characters | ~400 ms |
+| 4 | Full-screen OCR | ~250 ms |
+
+Looking up text the model already knows is **~5,000× cheaper** than the v0.4.0
+path (0.05 ms versus 244 ms). The response reports which rung answered, so you
+can see what a task is actually costing.
+
+Rung 3 is worth understanding: UIA's `TextRange.FindText` searches the
+application's *own* text buffer and returns exact bounding rectangles. It is
+immune to font, DPI, antialiasing and OCR error. It sits below the pixel rungs
+only because scanning a window's controls for it costs a few hundred
+milliseconds of cross-process COM — it is the accurate rung, not the fast one.
+
+> **Note on ordering.** These rungs are ordered by *measurement*, not by theory.
+> The common advice is to make the accessibility tree primary, but on real
+> applications it is not always cheaper: walking Chrome's tree took 537 ms here,
+> slower than a full-screen OCR pass, and VS Code exposed only 18 elements to it.
+> Neither pixels nor accessibility wins everywhere, which is why this is a
+> cascade rather than a choice.
+
+Enable delta observations for action tools with `--observation-mode delta`.
+The default remains `screenshot` for compatibility with existing clients.
+
 ## Configuration
 
 OSWright MCP server supports the following arguments. They can be provided in the JSON configuration as part of the `"args"` list:
@@ -166,6 +228,7 @@ OSWright MCP server supports the following arguments. They can be provided in th
 | `--ocr-languages <langs>` | OCR languages (default: `en`). Example: `--ocr-languages en es fr` | `OSWRIGHT_OCR_LANGUAGES` |
 | `--timeout <seconds>` | Default timeout for auto-wait operations (default: `10`). | `OSWRIGHT_TIMEOUT` |
 | `--snapshot-max-width <px>` | Downscale the auto-snapshot returned after each action. `0` (default) keeps full resolution. Lower values cut token cost significantly. | `OSWRIGHT_SNAPSHOT_MAX_WIDTH` |
+| `--observation-mode <mode>` | What action tools return: `screenshot` (default), `delta` (only what changed, ~30× fewer tokens), or `both`. | `OSWRIGHT_OBSERVATION_MODE` |
 | `--allow-remote` | Required to bind a non-loopback address. See [Security](#security). | |
 | `--log-level <level>` | Logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR`. Default: `INFO`. | `OSWRIGHT_LOG_LEVEL` |
 
@@ -393,6 +456,29 @@ image yourself.
 </details>
 
 <details>
+<summary><b>Incremental Perception</b></summary>
+
+- **observe** -- Report what changed on screen since the last observation. Rescans only the regions that moved. Prefer this over `screenshot` for tracking state.
+  - Parameters: `force_full`
+  - Read-only: **true**
+
+- **find_element** -- Find on-screen text using the cheapest method that can answer. Reports which cascade rung responded.
+  - Parameters: `text`, `exact`, `window_title`
+  - Read-only: **true**
+
+- **click_element** -- Find text via the cascade and click it. The cheap alternative to `click_text`.
+  - Parameters: `text`, `exact`, `button`, `window_title`
+
+- **read_model_text** -- Read on-screen text from the incremental model without re-OCRing the display.
+  - Parameters: `query`, `limit`
+  - Read-only: **true**
+
+- **perception_stats** -- Report how much perception work the model has avoided.
+  - Read-only: **true**
+
+</details>
+
+<details>
 <summary><b>Accessibility / UI Automation (Windows)</b></summary>
 
 - **get_ui_tree** -- Get the accessibility tree of the focused window. Returns all interactive elements with names, types, positions. Deterministic and instant.
@@ -444,6 +530,10 @@ oswright/
   screen.py            # Screen class (= Page)
   locator.py           # Locator + Assertions (= Locator + expect)
   capture.py           # Screen capture (mss - cross-platform, thread-safe)
+  dirty.py             # Change detection - which parts of the screen moved
+  screenmodel.py       # Persistent screen model, updated incrementally
+  cascade.py           # Resolution cascade - cheapest method that can answer
+  textprovider.py      # Exact text from the app itself via UIA TextPattern
   detect.py            # OCR dispatcher with caching (auto-selects best backend)
   _ocr_windows.py      # Windows OCR backend (instant, built-in)
   accessibility.py     # Windows UI Automation (deterministic element finding)
@@ -454,12 +544,28 @@ oswright/
   _input_pynput.py     # Linux/macOS input backend (pynput)
   window.py            # Window management (list, focus, close)
   clipboard.py         # Clipboard read/write (cross-platform)
-  mcp_server.py        # MCP server (36 tools for AI agents)
+  mcp_server.py        # MCP server (41 tools for AI agents)
 tests/
   conftest.py          # Fixtures that skip when no display/OCR is available
   test_core.py         # Unit tests (no desktop required)
+  test_perception.py   # Incremental perception (stubbed, runs headless)
   test_e2e.py          # End-to-end tests against the real desktop (marked `e2e`)
 ```
+
+### Not done yet
+
+Deliberately left for later, in rough order of expected value:
+
+- **DXGI dirty rectangles.** Windows' compositor already knows which pixels
+  changed and exposes them via `GetFrameDirtyRects`. OSWright currently computes
+  this itself by hashing tiles. Screen capture is now the largest remaining cost
+  per observation, so this is the next real win.
+- **A persistent per-application UI atlas.** Applications are deterministic: the
+  same dialog has the same layout every time. Caching layouts across sessions
+  would make repeat visits close to free.
+- **Speculative perception.** With an atlas and a cheap change oracle, an agent
+  could predict the post-action screen and verify the prediction rather than
+  re-perceiving. Correct predictions would cost nothing.
 
 ## Development
 

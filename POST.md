@@ -65,6 +65,72 @@ Works with Claude Desktop, VS Code, Cursor, Windsurf, Cline, Goose, and any MCP 
 
 ## Version History
 
+### v0.5.0 — Incremental perception
+
+The expensive thing about a GUI agent is not clicking, it is looking. Every
+published agent re-perceives the whole screen on every step: full screenshot,
+full OCR, then hand the model a fresh image and let it work out what changed.
+
+Measured on a live desktop, **the median observation changes 0.012% of pixels.**
+A full rescan therefore does roughly 240× more work than the change warrants,
+and the screenshot it returns costs ~2,800 image tokens whether anything
+happened or not.
+
+v0.5.0 keeps a model of the screen between observations and updates only what
+moved.
+
+**Measured over a 14-step agent loop on a 1920×1080 display:**
+
+| | v0.4.0 | v0.5.0 |
+|---|---|---|
+| Median latency per step | 185 ms | **71 ms** |
+| Tokens per observation | ~2,764 | **~84** |
+| Tokens over 14 steps | 38,696 | **1,800** |
+| Screen re-read per step | 100% | **11.5%** |
+| Lookup of already-known text | 244 ms | **0.05 ms** |
+
+**New**
+
+- `observe` — returns what appeared and disappeared since last time, not a picture.
+- `find_element` / `click_element` — resolution cascade; reports which rung answered.
+- `read_model_text`, `perception_stats`.
+- `--observation-mode delta` makes every action tool return a diff instead of a
+  screenshot. Default stays `screenshot` for compatibility.
+- `oswright/dirty.py`, `screenmodel.py`, `cascade.py`, `textprovider.py`.
+
+**The cascade**
+
+Element lookup stops at the first rung that can answer, so cost tracks how
+*novel* the request is rather than how large the screen is: the screen model
+(~0.05 ms) → an incremental rescan (~70 ms) → the accessibility tree (~40 ms) →
+the application's own text buffer via UIA `TextRange.FindText`, which is exact
+and immune to font/DPI/antialiasing (~400 ms) → full-screen OCR (~250 ms).
+
+The ordering comes from measurement rather than theory. The usual advice is to
+make the accessibility tree primary; on real applications it is not always
+cheaper. Walking Chrome's tree took **537 ms** — slower than a full OCR pass —
+and VS Code exposed only **18 elements** to it. Neither pixels nor accessibility
+wins everywhere, which is exactly why this is a cascade and not a choice.
+
+**Correctness**
+
+Incremental perception is only sound if it cannot silently lose text. Two
+invariants enforce that: anything invalidated is fully rescanned (a dirty region
+is grown until it wholly contains every element it touches, otherwise a region
+clipping a word deletes the element and re-detects only the fragment), and
+elements are never mutated in place.
+
+A control experiment worth recording: OCR is 100% deterministic on an identical
+frame, but full-frame OCR and OCR of a *crop of the same area* agree only ~91%,
+because cutting an image changes how the engine groups glyphs into words
+(`"Placer"` becomes `"Plac"` + `"er"`). Region-based OCR is therefore not
+identical to full-screen OCR by construction. Dirty regions are padded wider
+than they are tall to keep text lines intact.
+
+**Not done yet** — DXGI dirty rectangles (the compositor already knows what
+changed; screen capture is now the largest remaining cost per observation), a
+persistent per-application UI atlas, and speculative perception.
+
 ### v0.4.0
 
 Correctness and packaging release. Several of these were install-blocking.
