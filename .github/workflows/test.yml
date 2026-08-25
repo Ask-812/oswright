@@ -58,12 +58,17 @@ jobs:
       # declared OCR backend is EasyOCR, which drags in ~2.5 GB of torch. The
       # tests that need OCR or a display skip themselves, so CI installs only
       # the light runtime deps.
+      #
+      # The mcp bound must be repeated here. Installing with --no-deps means
+      # pyproject's `mcp[cli]>=1.0,<2` is not applied, and mcp 2.x removed
+      # mcp.server.fastmcp — which is exactly the breakage v0.4.0 fixed.
       - name: Install
         run: |
           pip install -e . --no-deps
-          pip install mss Pillow opencv-python-headless numpy "mcp[cli]" pynput pytest
+          pip install mss Pillow opencv-python-headless numpy "mcp[cli]<2" pynput pytest
+      # The e2e suite drives a real desktop; this runner has none.
       - name: Test
-        run: python -m pytest tests/ -v
+        run: python -m pytest tests/ -v -m "not e2e"
 
   build:
     runs-on: ubuntu-latest

@@ -145,10 +145,12 @@ class ScreenModel:
         capture: ScreenCapture,
         ocr: OCREngine,
         monitor: int = 0,
+        atlas=None,
     ):
         self._capture = capture
         self._ocr = ocr
         self._monitor = monitor
+        self._atlas = atlas
         self._tracker = DirtyTracker()
         self._elements: list[Element] = []
         self._last_total_pixels = 0
@@ -157,6 +159,8 @@ class ScreenModel:
             "full_rescans": 0,
             "compositor_skips": 0,
             "compositor_captures": 0,
+            "atlas_hits": 0,
+            "atlas_misses": 0,
             "regions_scanned": 0,
             "pixels_scanned": 0,
             "pixels_total": 0,
@@ -176,6 +180,53 @@ class ScreenModel:
         self._elements = []
 
     # --- observation ---
+
+    def warm_start(self, image: Optional[Image.Image] = None) -> bool:
+        """
+        Seed the model from the atlas instead of reading the whole screen.
+
+        Only useful when the model is cold — arriving at a window for the first
+        time, or after a reset. Returns True if a remembered screen was
+        recognised *and* verified, in which case the model is populated without
+        a full read.
+
+        A failed attempt costs a layout signature and a few tiny image
+        comparisons, which is negligible next to the full read it was trying to
+        avoid.
+        """
+        if self._atlas is None:
+            return False
+
+        if image is None:
+            image = self._acquire_frame()
+
+        context = self._atlas_context(image)
+        entry = self._atlas.recall(image, context)
+        if entry is None:
+            self.stats["atlas_misses"] += 1
+            return False
+
+        self._elements = list(entry.elements)
+        # Establish the change baseline against this frame, so the next
+        # observation reports only what moves from here.
+        self._tracker.update(image)
+        self._last_total_pixels = image.width * image.height
+        self.stats["atlas_hits"] += 1
+        logger.debug("Warm start from atlas: %d elements", len(self._elements))
+        return True
+
+    def _atlas_context(self, image: Image.Image):
+        from oswright.atlas import current_context
+
+        return current_context(monitor_size=image.size)
+
+    def remember(self, image: Optional[Image.Image] = None) -> bool:
+        """Store the current screen in the atlas for future visits."""
+        if self._atlas is None or not self._elements:
+            return False
+        if image is None:
+            image = self._acquire_frame()
+        return self._atlas.remember(image, self._atlas_context(image), self._elements) is not None
 
     def observe(self, force_full: bool = False, image: Optional[Image.Image] = None) -> Delta:
         """
@@ -356,6 +407,8 @@ class ScreenModel:
             "full_rescans": self.stats["full_rescans"],
             "compositor_skips": self.stats["compositor_skips"],
             "compositor_captures": self.stats["compositor_captures"],
+            "atlas_hits": self.stats["atlas_hits"],
+            "atlas_misses": self.stats["atlas_misses"],
             "compositor_active": self._tracker.compositor_active,
             "pixels_scanned": scanned,
             "pixels_total": total,

@@ -8,6 +8,7 @@ what is on screen — run them yourself rather than trusting the numbers below.
 python benchmarks/bench_change.py     # how much the screen actually changes
 python benchmarks/bench_methods.py    # cost of each perception method
 python benchmarks/bench_pipeline.py   # v0.4.0 path vs v0.5.0 path, end to end
+python benchmarks/bench_atlas.py      # cost of a return visit to a known screen
 ```
 
 Reference machine: HP EliteBook 840 G8, Intel Iris Xe, 16 GB RAM, 1920×1080 at
@@ -69,3 +70,23 @@ lookup of known text:
   v0.4.0 (capture + full OCR) :    317.9 ms
   v0.5.0 (cascade rung 0)     :    0.055 ms   5,801x cheaper
 ```
+
+## `bench_atlas.py` — the cost of a return visit
+
+```
+cold: full screen read                   125.2 ms
+warm: recognise + verify                   1.41 ms
+recall hit rate: 5/5
+warm start is 89x cheaper than reading the screen
+
+rejections (all should be None):
+  blank screen            : None
+  inverted screen         : None
+  same pixels, other app  : None
+```
+
+The rejections matter more than the speedup. An atlas that returns a stale
+layout makes the agent click somewhere arbitrary, so verification must fail
+closed — note that the inverted screen is *recognised* by the layout signature
+(inverting does not move edges) and then *rejected* by the pixel check. That
+split is the design: the signature filters, verification guarantees.

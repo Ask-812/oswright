@@ -14,11 +14,12 @@ A Model Context Protocol (MCP) server that provides **OS-level desktop automatio
 - **Clipboard access.** Read and write system clipboard for data transfer.
 - **App launcher.** Launch applications and wait for them to load.
 - **Auto-snapshot.** Every action returns a screenshot so the agent always sees current state.
-- **41 MCP tools.** Screen, OCR, UIA, mouse, keyboard, windows, clipboard, and compound actions.
+- **43 MCP tools.** Screen, OCR, UIA, mouse, keyboard, windows, clipboard, and compound actions.
 - **Incremental perception.** Rescans only the parts of the screen that changed, and can return what changed instead of a full screenshot — ~21× fewer tokens per step.
+- **Screen memory.** Recognises screens it has read before and reuses them, verified by pixels — 89× cheaper than reading again.
 - **Resolution cascade.** Element lookups stop at the cheapest method that works; repeat lookups cost ~0.05 ms.
 - **DPI-correct.** Coordinates are physical pixels everywhere, so clicks land correctly on scaled displays.
-- **Test suite.** 132 automated tests; the desktop-driving ones skip themselves when no display is available.
+- **Test suite.** 180 automated tests; the desktop-driving ones skip themselves when no display is available.
 
 ### Requirements
 
@@ -256,6 +257,7 @@ OSWright MCP server supports the following arguments. They can be provided in th
 | `--timeout <seconds>` | Default timeout for auto-wait operations (default: `10`). | `OSWRIGHT_TIMEOUT` |
 | `--snapshot-max-width <px>` | Downscale the auto-snapshot returned after each action. `0` (default) keeps full resolution. Lower values cut token cost significantly. | `OSWRIGHT_SNAPSHOT_MAX_WIDTH` |
 | `--observation-mode <mode>` | What action tools return: `screenshot` (default), `delta` (only what changed, ~30× fewer tokens), or `both`. | `OSWRIGHT_OBSERVATION_MODE` |
+| `--no-atlas` | Do not remember screens across visits. | `OSWRIGHT_NO_ATLAS` |
 | `--allow-remote` | Required to bind a non-loopback address. See [Security](#security). | |
 | `--log-level <level>` | Logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR`. Default: `INFO`. | `OSWRIGHT_LOG_LEVEL` |
 
@@ -503,6 +505,12 @@ image yourself.
 - **perception_stats** -- Report how much perception work the model has avoided.
   - Read-only: **true**
 
+- **remember_screen** -- Remember the current screen so future visits skip reading it. Persists across sessions.
+  - Read-only: **true**
+
+- **atlas_stats** -- Report what the screen atlas has remembered and how often it helped.
+  - Read-only: **true**
+
 </details>
 
 <details>
@@ -560,6 +568,7 @@ oswright/
   dirty.py             # Change detection - which parts of the screen moved
   screenmodel.py       # Persistent screen model, updated incrementally
   cascade.py           # Resolution cascade - cheapest method that can answer
+  atlas.py             # Remembers screens across visits and sessions
   textprovider.py      # Exact text from the app itself via UIA TextPattern
   detect.py            # OCR dispatcher with caching (auto-selects best backend)
   _ocr_windows.py      # Windows OCR backend (instant, built-in)
@@ -572,24 +581,33 @@ oswright/
   _input_pynput.py     # Linux/macOS input backend (pynput)
   window.py            # Window management (list, focus, close)
   clipboard.py         # Clipboard read/write (cross-platform)
-  mcp_server.py        # MCP server (41 tools for AI agents)
+  mcp_server.py        # MCP server (43 tools for AI agents)
 tests/
   conftest.py          # Fixtures that skip when no display/OCR is available
   test_core.py         # Unit tests (no desktop required)
   test_perception.py   # Incremental perception (stubbed, runs headless)
+  test_atlas.py        # Screen memory and its failure modes (headless)
   test_e2e.py          # End-to-end tests against the real desktop (marked `e2e`)
 ```
 
+### Remembering screens
+
+Applications are deterministic — the same dialog has the same layout every time.
+OSWright remembers screens it has read and reuses them on the next visit, across
+sessions: **125 ms cold read → 1.4 ms warm recall (89×)**.
+
+A remembered screen is never trusted on recognition alone. A few regions are
+spot-checked *by pixels* before the layout is reused, so a screen that has
+changed is rejected rather than acted on. Verification fails closed: a screen
+with nothing checkable is not remembered at all.
+
+Disable with `--no-atlas`. Remembered screens live in `~/.oswright/atlas.json`.
+
 ### Not done yet
 
-Deliberately left for later, in rough order of expected value:
-
-- **A persistent per-application UI atlas.** Applications are deterministic: the
-  same dialog has the same layout every time. Caching layouts across sessions
-  would make repeat visits close to free.
-- **Speculative perception.** With an atlas and the change oracle that now
-  exists, an agent could predict the post-action screen and verify the
-  prediction rather than re-perceiving. Correct predictions would cost nothing.
+- **Speculative perception.** With both the atlas and the change oracle in
+  place, an agent could predict the post-action screen and verify the prediction
+  rather than re-perceiving. Correct predictions would cost nothing.
 - **Wayland input injection**, and macOS `AXTextMarker` as a TextPattern
   equivalent.
 
