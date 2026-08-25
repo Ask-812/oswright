@@ -273,6 +273,51 @@ class TestPredictionSerialisation:
         assert payload["surprise"] == "unexpected dialog"
 
 
+class TestServerLaziness:
+    """
+    Waiting for the screen must not drag heavy machinery into existence.
+
+    Settling needs only the compositor. Routing it through the screen model
+    would build an OCR engine as a side effect, which on Linux means loading
+    PyTorch -- seconds of work and hundreds of MB, purely in order to wait.
+    """
+
+    @staticmethod
+    def _server():
+        server = pytest.importorskip("oswright.mcp_server")
+        # These are process-global; reset so the assertions mean something.
+        server._ocr = None
+        server._transitions = None
+        server._settle_tracker = None
+        return server
+
+    def test_settling_does_not_build_an_ocr_engine(self):
+        server = self._server()
+        server._observation_mode = "screenshot"
+        server._settle()
+        assert server._ocr is None, "waiting for the screen built an OCR engine"
+
+    def test_screenshot_mode_skips_speculation(self):
+        """
+        In screenshot mode a full image is captured and encoded regardless, so
+        predicting its contents saves nothing and would only cost an OCR engine.
+        """
+        server = self._server()
+        server._observation_mode = "screenshot"
+        assert server._get_transitions() is None
+        assert server._ocr is None
+
+    def test_speculation_disabled_without_the_atlas(self):
+        server = self._server()
+        server._observation_mode = "delta"
+        original = server._atlas_enabled
+        server._atlas_enabled = False
+        try:
+            assert server._get_transitions() is None
+        finally:
+            server._atlas_enabled = original
+
+
 class TestSettle:
     class Source:
         """A scripted compositor: each poll returns the next canned result."""
