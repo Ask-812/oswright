@@ -105,17 +105,46 @@ from v0.4-style full-screenshot perception to memory plus prediction.
 
 Tasks drive the real MCP tool surface and are verified against **Calculator's
 own state via UI Automation** — grading OCR with OCR would only prove it agrees
-with itself. Each task runs three times per configuration, because a single
+with itself. Each task runs several times per configuration, because a single
 sample cannot distinguish "this configuration is worse" from "that click did
-not register".
+not register". Set `OSWRIGHT_BENCH_REPEATS` to raise the count when a result
+is load-bearing; three proved too few (see below).
 
-**Status: written and structurally validated, full sweep not yet run.** Partial
-runs during development showed no accuracy difference between configurations,
-with token cost falling by roughly an order of magnitude — but that is not the
-same as a completed measurement and should not be quoted as one.
+**Result, 60 runs:**
 
-Two findings did come out of building it, and both are real:
+| configuration | passed | median | tokens |
+|---|---|---|---|
+| v0.4-style (full screenshot, no memory) | 15/15 | 7.2 s | 170,690 |
+| delta only | 14/15 | 6.9 s | 8,622 |
+| delta + memory | 15/15 | 6.8 s | 9,052 |
+| delta + memory + prediction | 15/15 | 6.9 s | 12,916 |
 
+**59/60. Accuracy is flat across every configuration and token cost falls
+19.8×** — cheaper did not mean worse, which is what every other benchmark here
+was only a proxy for.
+
+The one failure was not a perception failure and the harness said so: Calculator
+itself showed `49` after being driven `4 + 5 =`, so a XAML button dropped an
+invoke. Tasks check the application's own state before grading perception
+precisely so this cannot be misreported.
+
+Read the table with two caveats. **Wall-clock barely moves** because these tasks
+are dominated by Calculator's ~3 s launch and the deliberate 0.35 s settle
+between clicks — perception is a small share of the total, and its latency win
+is the one in `bench_pipeline.py`. And **memory and prediction do not pay for
+themselves here**; they amortise over repeat visits, and a handful of short
+novel tasks contains none.
+
+Findings from building it, which are worth as much as the table:
+
+- **It caught a bug 221 tests could not.** Desktop Duplication was silently
+  disabled for half the system, because Windows grants one per process and
+  oswright built two (see `ENGINEERING_LOG.md` §2.13). Fixing it is what took
+  the token reduction from 7.2× to 19.8×. Only a full-system run could see it.
+- **Three repeats were not enough.** One sweep reported 24/36 with a task
+  failing in all four configurations — a systematic-looking signal that turned
+  out to be environmental; the next identical sweep reported 36/36. Reproduce a
+  finding before explaining it.
 - **Windows OCR cannot see isolated digits.** It returned 30 text elements from
   the Calculator window — `DEG`, `MC`, `Function`, `Trigonometry`, `log` — and
   **not one digit**. Text recognisers are trained on words and lines; a lone

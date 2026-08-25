@@ -562,13 +562,35 @@ across four configurations from v0.4-style full-screenshot perception to memory
 plus prediction, verified against **Calculator's own state via UI Automation**.
 Grading OCR with OCR would only establish that it agrees with itself.
 
-**Status: written and structurally validated, full sweep not yet run** — it
-takes about six minutes of Calculator windows stealing focus, and the machine
-was in use. Partial runs during development showed no accuracy difference
-between configurations with token cost falling by roughly an order of magnitude,
-but a partial run is not a measurement and is not quoted as one.
+**Result, 60 runs (5 per task per configuration):**
 
-Building it produced three findings that are worth more than the sweep.
+| configuration | passed | median | tokens |
+|---|---|---|---|
+| v0.4-style (full screenshot, no memory) | 15/15 | 7.2 s | 170,690 |
+| delta only | 14/15 | 6.9 s | 8,622 |
+| delta + memory | 15/15 | 6.8 s | 9,052 |
+| delta + memory + prediction | 15/15 | 6.9 s | 12,916 |
+
+**59/60. Accuracy is flat across every configuration; token cost falls 19.8×.**
+That is the claim the previous eight versions of work were making on credit, and
+it is now paid for: cheaper did not mean worse.
+
+The single failure was not a perception failure, and the harness said so —
+Calculator itself showed `49` after being driven `4 + 5 =`, so a XAML button
+dropped an invoke. The task checks the application's own state *before* grading
+perception precisely so that a dropped click cannot be reported as a perception
+defect.
+
+Two honest caveats. **Wall-clock barely moved** (7.2 s → 6.9 s) because these
+tasks are dominated by Calculator's ~3 s launch and the deliberate 0.35 s settle
+between clicks; perception is a small part of the total, and the win is in tokens
+and in the per-observation latency measured in §2.4. And **memory and prediction
+do not pay for themselves here** — they amortise over repeat visits, and a
+handful of short novel tasks contains none. Reporting that plainly is more useful
+than a benchmark shaped to flatter the newest feature.
+
+Getting to that number required fixing a bug that only a full-system run could
+expose (§2.13). Building the harness produced three more findings.
 
 **Windows OCR cannot see isolated digits.** Pointed at Calculator it returned 30
 text elements — `DEG`, `MC`, `Function`, `Trigonometry`, `log` — and **not one
@@ -591,6 +613,16 @@ invoke before the next one lands. A single sample cannot distinguish "this
 configuration is worse" from "that click did not register". Three repeats and a
 settle delay turned a noise generator into a measurement.
 
+Three was still not enough. One sweep reported **24/36** with one task failing in
+all four configurations — a clean, systematic-looking signal that I spent real
+time chasing as a cascade defect. The next sweep, with no change to the code
+under test, reported **36/36**. The failure had been environmental. The lesson is
+not "add repeats" but *a result that looks systematic can still be noise, and the
+way to find out is to reproduce it before explaining it* — I built a whole
+hypothesis about stale coordinates before checking whether the finding was real.
+The repeat count is now an environment variable, so a load-bearing number can be
+re-run at higher N instead of trusted at three.
+
 **A safety decision worth recording.** Notepad was the obvious second subject,
 until launching it restored a document with unsaved changes belonging to the
 machine's owner. A benchmark has no business anywhere near that, so the subject
@@ -603,6 +635,82 @@ file was left at zero bytes. `atlas.save()` writes to a temporary file and
 renames it precisely so an interrupted save cannot do this; the throwaway script
 did not, because it was throwaway. Small tools deserve the same care as the code
 they edit.
+
+---
+
+### 2.13 The bug that every isolated benchmark passed
+
+Running the full sweep surfaced a line in the logs that no component test ever
+produced:
+
+```
+Desktop Duplication unavailable (COMError: (-2147024809, 'The parameter is
+incorrect.', ...)); using tile hashing
+```
+
+`E_INVALIDARG`, once per configuration, on a machine where I had personally
+measured Desktop Duplication working at 0.14 ms (§2.6). The fallback did its job
+— nothing broke — which is exactly why it had gone unnoticed.
+
+Probing it in isolation, duplication worked. Probing it after importing the
+server, it failed. The decisive experiment was to build two sources in one
+process:
+
+| | result |
+|---|---|
+| first instance | succeeds |
+| second instance, while the first is alive | **E_INVALIDARG** |
+| new instance, after closing the first | succeeds |
+
+**Windows grants one Desktop Duplication per output per process.** oswright built
+two: one for settle detection, one for the screen model. Whichever touched the
+compositor first won, and the other silently spent the entire project running on
+tile hashing.
+
+So the compositor path I designed, hand-wrote COM bindings for, benchmarked at
+0.14 ms and wrote up in §2.6 **was half disabled in the actual server**. Every
+component was correct alone. The defect lived in the composition, and the only
+thing that could see it was a full-system run — which is the argument for
+`bench_tasks.py` existing, made better than I could have made it deliberately.
+
+The fix is to model the resource the way the OS actually grants it: one per
+process, borrowed rather than owned, reference-counted, keyed by thread as well
+as output because a duplication belongs to the thread that created it.
+
+```python
+def acquire_shared(output_index: int = 0) -> "DxgiDirtySource":
+    key = (threading.get_ident(), output_index)
+    with _shared_lock:
+        source = _shared_sources.get(key)
+        if source is None:
+            source = DxgiDirtySource(output_index)
+            source._shared_key = key
+            _shared_sources[key] = source
+        _shared_refs[key] = _shared_refs.get(key, 0) + 1
+    return source
+```
+
+The measured effect was larger than the fix looked. With the compositor actually
+answering, an unchanged screen is confirmed authoritatively instead of being
+re-examined, so observations stop producing payload:
+
+| | before | after |
+|---|---|---|
+| tokens, delta-only, 15 runs | 23,584 | **8,622** |
+| total reduction vs v0.4-style | 7.2× | **19.8×** |
+
+A resource-ownership bug worth 2.7× in tokens, invisible to 221 passing tests and
+to every benchmark that measured one component at a time.
+
+Two things now guard it. A test asserts that two trackers share one source and
+that the refcount returns to zero on release — a *test*, not a benchmark, because
+the failure mode is silent degradation rather than a wrong answer. And the
+docstring on `DxgiDirtySource` now says the constraint out loud, since the class
+is impossible to use correctly without knowing it.
+
+**The general lesson:** a fallback that hides a defect is worse than no fallback
+unless something is watching whether it fires. Graceful degradation without
+observability is just a bug with good manners.
 
 ---
 
@@ -677,6 +785,18 @@ Worth knowing, because these are the questions an interviewer will ask.
 16. **Truncated a file with `open(path, "w")` in a throwaway patch script** that
     then raised, leaving it empty (§2.12). The production code writes to a
     temporary file and renames precisely to prevent this.
+
+17. **Built two owners for a resource the OS grants once per process.** Desktop
+    Duplication was silently half-disabled for the entire project because the
+    second `DirtyTracker` lost the race and fell back to hashing (§2.13). Every
+    component passed alone; only a full-system run could see it.
+18. **Shipped a fallback with no observability.** The degradation logged at
+    `INFO` and was drowned in benchmark output for weeks. A fallback nothing
+    watches is a bug with good manners (§2.13).
+19. **Believed a systematic-looking failure without reproducing it.** A 24/36
+    sweep with one task failing in all four configurations read as a real
+    defect; the next identical sweep returned 36/36 (§2.12). I built the
+    hypothesis before confirming the finding.
 
 Approaches investigated and rejected on evidence:
 

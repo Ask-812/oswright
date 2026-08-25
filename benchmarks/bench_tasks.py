@@ -12,7 +12,10 @@ checking OCR with OCR would only prove it agrees with itself.
 
 Every task runs several times per configuration. A single sample cannot
 distinguish "this configuration is worse" from "that click did not register",
-and an earlier version of this file reported both as the same thing.
+and an earlier version of this file reported both as the same thing. Even
+three samples proved too few: one sweep reported 24/36 and the next 36/36
+with no change to the code under test. Raise the count when a result is
+load-bearing.
 
 Safety: Calculator is the only subject. It is stateless, so opening and closing
 it cannot lose anyone's work. Notepad was rejected after it restored a document
@@ -20,9 +23,11 @@ with unsaved changes on launch, which is not something a benchmark should be
 anywhere near. Every task closes what it opened.
 
 Run:  python benchmarks/bench_tasks.py
+      OSWRIGHT_BENCH_REPEATS=5 python benchmarks/bench_tasks.py
 """
 
 import json
+import os
 import statistics
 import subprocess
 import time
@@ -36,7 +41,7 @@ from oswright.window import close_window, focus_window, list_windows
 IMAGE_TOKENS_PER_PIXEL = 1 / 750
 CALC_TITLE = "Calculator"
 
-REPEATS = 3
+REPEATS = int(os.environ.get("OSWRIGHT_BENCH_REPEATS", "3"))
 
 # Calculator's XAML buttons need a moment to process an invoke before the next
 # one lands. Too short a gap produces dropped clicks that look exactly like
@@ -150,16 +155,31 @@ def task_arithmetic_by_label(meter):
     if window is None:
         return False, "Calculator did not open"
 
+    # Where each click actually landed, and which rung of the cascade decided
+    # it. Costs nothing to collect and turns "the answer was wrong" into
+    # "rung 0 returned a coordinate outside the window", which is a diagnosis.
+    trace = []
     try:
         for label in ("Seven", "Multiply by", "Eight", "Equals"):
             out = meter.record(server.click_element(text=label, window_title=CALC_TITLE))
             payload = json.loads(out[0])
             if "error" in payload:
                 return False, f"could not click {label!r}: {payload['error'][:60]}"
+            spot = payload.get("clicked") or {}
+            trace.append(
+                f"{label}@r{payload.get('rung')}"
+                f"({spot.get('x')},{spot.get('y')})"
+            )
             time.sleep(CLICK_SETTLE_S)
 
         shown = read_display(window)
-        return shown == "56", f"display showed {shown!r}, expected '56'"
+        if shown == "56":
+            return True, ""
+        return False, (
+            f"display showed {shown!r}, expected '56'; "
+            f"window={window.left},{window.top} {window.width}x{window.height}; "
+            + " ".join(trace)
+        )
     finally:
         cleanup(window)
 
@@ -235,7 +255,15 @@ def apply(config):
     server._observation_mode = config["observation_mode"]
     server._atlas_enabled = config["atlas"]
     server._speculate_enabled = config["speculate"]
-    # Force per-config state to be rebuilt rather than carried over.
+    # Force per-config state to be rebuilt rather than carried over. Closing
+    # the old model matters: it holds a borrowed Desktop Duplication, and
+    # Windows grants only one per process, so dropping it without releasing
+    # leaks the handle that the next configuration needs.
+    if server._model is not None:
+        try:
+            server._model.close()
+        except Exception:
+            pass
     server._model = None
     server._transitions = None
 

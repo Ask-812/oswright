@@ -191,6 +191,23 @@ on screen, whereas the incremental path scales with how much *changed*. The same
 comparison measures 6.5× on a quiet desktop and **14.3×** with a dense web page
 open. Re-measure with [`benchmarks/`](benchmarks/) rather than trusting these.
 
+Cost is a proxy, though, and a cheaper perception path that quietly degraded
+accuracy would be worse than none. So it is checked against task completion —
+60 scripted runs driving the real tool surface, graded against Calculator's own
+state through UI Automation rather than against OCR output:
+
+| configuration | passed | tokens |
+|---|---|---|
+| v0.4-style (full screenshot, no memory) | 15/15 | 170,690 |
+| delta only | 14/15 | **8,622** |
+| delta + memory | 15/15 | 9,052 |
+| delta + memory + prediction | 15/15 | 12,916 |
+
+**Accuracy is flat across every configuration while token cost falls 19.8×.**
+The one failure was a dropped click that the harness caught and attributed to
+the application, not to perception. Run it with
+`python benchmarks/bench_tasks.py`.
+
 ### The resolution cascade
 
 `find_element` and `click_element` stop at the first method that can answer,
@@ -656,11 +673,15 @@ about 32 pixels, while genuine UI changes cover tens of thousands.
 
 ### What is measured, and what is not
 
-Every number here is perception **cost**, reproducible via `benchmarks/`. Task
-**success** — whether an agent actually completes work — has a harness
-(`benchmarks/bench_tasks.py`) but no completed sweep, and no head-to-head
-against other GUI agents. Cheaper perception is established; *better outcomes*
-is not, and the difference matters.
+Perception **cost** and task **success** are both measured on this machine and
+reproducible via `benchmarks/` — cheaper perception does not cost accuracy.
+
+What is *not* established is a head-to-head against other GUI agents. The task
+suite is three short Calculator tasks on one Windows 11 laptop, chosen because
+Calculator is stateless and safe to open repeatedly; it is not a broad
+application corpus, and it says nothing about how oswright compares to
+Windows-MCP or any other agent on real work. "Cheaper, with no accuracy loss on
+these tasks" is the claim. "Better agent" is not.
 
 ## Development
 

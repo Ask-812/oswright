@@ -219,10 +219,13 @@ class DirtyTracker:
             return self._compositor
         self._compositor_tried = True
         try:
-            from oswright._dxgi_windows import DxgiDirtySource, is_available
+            from oswright._dxgi_windows import acquire_shared, is_available
 
             if is_available():
-                self._compositor = DxgiDirtySource()
+                # Borrowed, not built: Windows grants one duplication per
+                # output per process, and this class is instantiated more
+                # than once (settle detection and the screen model).
+                self._compositor = acquire_shared()
         except Exception:  # pragma: no cover - platform dependent
             logger.debug("Compositor change source unavailable", exc_info=True)
         return self._compositor
@@ -298,10 +301,17 @@ class DirtyTracker:
         self._size = None
 
     def close(self):
-        """Release the compositor source, if one was created."""
+        """Give back the shared compositor source, if one was borrowed."""
         if self._compositor is not None:
-            self._compositor.close()
+            try:
+                from oswright._dxgi_windows import release_shared
+
+                release_shared(self._compositor)
+            except Exception:  # pragma: no cover - platform dependent
+                self._compositor.close()
             self._compositor = None
+        # Allow a later call to borrow again rather than staying dead.
+        self._compositor_tried = False
 
     def update(self, image: Image.Image) -> list[Region]:
         """
