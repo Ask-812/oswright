@@ -11,7 +11,7 @@ can't find elements (e.g., in apps without proper accessibility support).
 
 import logging
 import platform
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -105,6 +105,19 @@ def _control_to_element(ctrl) -> Optional[UIElement]:
         return None
 
 
+def _normalize_control_type(name: str) -> str:
+    """
+    Normalize a control type for comparison.
+
+    UIA reports "ButtonControl" while callers naturally write "Button", and
+    get_ui_tree shows the former — so both must compare equal.
+    """
+    lowered = (name or "").strip().lower()
+    if lowered.endswith("control"):
+        lowered = lowered[: -len("control")]
+    return lowered
+
+
 def get_focused_window_tree(max_depth: int = 5) -> list[UIElement]:
     """
     Get the accessibility tree of the currently focused window.
@@ -131,7 +144,10 @@ def _walk_tree(ctrl, elements: list, depth: int, max_depth: int):
         return
 
     el = _control_to_element(ctrl)
-    if el and not el.is_offscreen and el.name:
+    # Keep anything addressable. Requiring a name hid controls that expose only
+    # an AutomationId, even though click_ui_element/fill_ui_element can target
+    # exactly those.
+    if el and not el.is_offscreen and (el.name or el.automation_id):
         elements.append(el)
 
     try:
@@ -140,6 +156,40 @@ def _walk_tree(ctrl, elements: list, depth: int, max_depth: int):
             _walk_tree(child, elements, depth + 1, max_depth)
     except Exception:
         pass
+
+
+def _resolve_target(window_title: Optional[str]):
+    """Get the UIA root to search under: a named window, or the focused one."""
+    if window_title:
+        return auto.WindowControl(searchDepth=1, SubName=window_title)
+    return auto.GetForegroundControl()
+
+
+def _build_conditions(
+    name: Optional[str] = None,
+    control_type: Optional[str] = None,
+    automation_id: Optional[str] = None,
+) -> dict:
+    """
+    Build uiautomation search kwargs. Returns {} when nothing was specified.
+
+    Raises ValueError for an unrecognised control type rather than silently
+    searching with ControlType=None, which matches nothing useful.
+    """
+    conditions = {}
+    if name:
+        conditions["SubName"] = name
+    if automation_id:
+        conditions["AutomationId"] = automation_id
+    if control_type:
+        resolved = getattr(
+            auto.ControlType, control_type + "Control",
+            getattr(auto.ControlType, control_type, None),
+        )
+        if resolved is None:
+            raise ValueError(f"Unknown control type: {control_type}")
+        conditions["ControlType"] = resolved
+    return conditions
 
 
 def find_element(
@@ -164,26 +214,11 @@ def find_element(
         return None
 
     try:
-        if window_title:
-            target = auto.WindowControl(searchDepth=1, SubName=window_title)
-        else:
-            target = auto.GetForegroundControl()
-
+        target = _resolve_target(window_title)
         if target is None:
             return None
 
-        # Build search conditions
-        conditions = {}
-        if name:
-            conditions["SubName"] = name
-        if control_type:
-            conditions["ControlType"] = getattr(
-                auto.ControlType, control_type + "Control",
-                getattr(auto.ControlType, control_type, None)
-            )
-        if automation_id:
-            conditions["AutomationId"] = automation_id
-
+        conditions = _build_conditions(name, control_type, automation_id)
         if not conditions:
             return None
 
@@ -218,11 +253,7 @@ def find_all_elements(
         return []
 
     try:
-        if window_title:
-            target = auto.WindowControl(searchDepth=1, SubName=window_title)
-        else:
-            target = auto.GetForegroundControl()
-
+        target = _resolve_target(window_title)
         if target is None:
             return []
 
@@ -230,11 +261,12 @@ def find_all_elements(
         _walk_tree(target, all_elements, depth=0, max_depth=max_depth)
 
         # Filter
+        wanted_type = _normalize_control_type(control_type) if control_type else None
         results = []
         for el in all_elements:
             if name and name.lower() not in el.name.lower():
                 continue
-            if control_type and control_type.lower() != el.control_type.lower().replace("control", ""):
+            if wanted_type and wanted_type != _normalize_control_type(el.control_type):
                 continue
             results.append(el)
 
@@ -260,25 +292,11 @@ def click_element(
         return None
 
     try:
-        if window_title:
-            target = auto.WindowControl(searchDepth=1, SubName=window_title)
-        else:
-            target = auto.GetForegroundControl()
-
+        target = _resolve_target(window_title)
         if target is None:
             return None
 
-        conditions = {}
-        if name:
-            conditions["SubName"] = name
-        if control_type:
-            conditions["ControlType"] = getattr(
-                auto.ControlType, control_type + "Control",
-                getattr(auto.ControlType, control_type, None)
-            )
-        if automation_id:
-            conditions["AutomationId"] = automation_id
-
+        conditions = _build_conditions(name, control_type, automation_id)
         if not conditions:
             return None
 
@@ -326,20 +344,11 @@ def set_element_value(
         return False
 
     try:
-        if window_title:
-            target = auto.WindowControl(searchDepth=1, SubName=window_title)
-        else:
-            target = auto.GetForegroundControl()
-
+        target = _resolve_target(window_title)
         if target is None:
             return False
 
-        conditions = {}
-        if name:
-            conditions["SubName"] = name
-        if automation_id:
-            conditions["AutomationId"] = automation_id
-
+        conditions = _build_conditions(name, automation_id=automation_id)
         if not conditions:
             return False
 

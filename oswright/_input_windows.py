@@ -4,11 +4,22 @@ Windows input backend using Win32 API (SendInput, SetCursorPos, GetCursorPos).
 Used automatically on Windows. No external dependencies beyond ctypes (stdlib).
 """
 
-import time
-from typing import Optional, Literal
-
 import ctypes
 import ctypes.wintypes
+import logging
+import time
+from typing import Literal, Optional
+
+from oswright._dpi import ensure_dpi_aware
+
+logger = logging.getLogger(__name__)
+
+# Mouse coordinates are physical pixels; without this they would be logical
+# pixels on a scaled display and every click would be offset.
+ensure_dpi_aware()
+
+# use_last_error lets SendInput failures report a real GetLastError value.
+user32 = ctypes.WinDLL("user32", use_last_error=True)
 
 # Windows API constants
 INPUT_MOUSE = 0
@@ -82,11 +93,34 @@ class INPUT(ctypes.Structure):
     _fields_ = [("type", ctypes.wintypes.DWORD), ("union", INPUT_UNION)]
 
 
-def _send_input(*inputs):
-    """Send input events to the OS."""
+# Explicit signatures: on 64-bit Windows the default int return/args silently
+# truncate pointers and produce wrong results.
+user32.SendInput.argtypes = [ctypes.wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
+user32.SendInput.restype = ctypes.wintypes.UINT
+user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+user32.SetCursorPos.restype = ctypes.wintypes.BOOL
+user32.GetCursorPos.argtypes = [ctypes.POINTER(ctypes.wintypes.POINT)]
+user32.GetCursorPos.restype = ctypes.wintypes.BOOL
+
+
+def _send_input(*inputs) -> int:
+    """
+    Send input events to the OS.
+
+    Returns the number of events accepted. A short count means the events were
+    blocked — commonly by UIPI, when a more-elevated window has focus.
+    """
     n = len(inputs)
     arr = (INPUT * n)(*inputs)
-    ctypes.windll.user32.SendInput(n, arr, ctypes.sizeof(INPUT))
+    sent = user32.SendInput(n, arr, ctypes.sizeof(INPUT))
+    if sent != n:
+        err = ctypes.get_last_error()
+        logger.warning(
+            "SendInput delivered %d/%d events (error %d). Input may be blocked by "
+            "a more-privileged window; try running with matching privileges.",
+            sent, n, err,
+        )
+    return sent
 
 
 class Mouse:
@@ -96,13 +130,21 @@ class Mouse:
     def get_position() -> tuple[int, int]:
         """Get current cursor position."""
         point = ctypes.wintypes.POINT()
-        ctypes.windll.user32.GetCursorPos(ctypes.byref(point))
+        if not user32.GetCursorPos(ctypes.byref(point)):
+            raise OSError(
+                f"GetCursorPos failed (error {ctypes.get_last_error()}). "
+                "The session may be locked or on a secure desktop."
+            )
         return (point.x, point.y)
 
     @staticmethod
     def move(x: int, y: int):
         """Move cursor to absolute screen coordinates."""
-        ctypes.windll.user32.SetCursorPos(x, y)
+        if not user32.SetCursorPos(int(x), int(y)):
+            raise OSError(
+                f"SetCursorPos({x}, {y}) failed (error {ctypes.get_last_error()}). "
+                "The coordinates may be off-screen, or the session may be locked."
+            )
 
     @staticmethod
     def click(
@@ -185,6 +227,11 @@ class Mouse:
             duration: Total drag duration in seconds.
             steps: Number of intermediate positions.
         """
+        if steps < 1:
+            raise ValueError(f"steps must be >= 1 (got {steps})")
+        if duration < 0:
+            raise ValueError(f"duration must be >= 0 (got {duration})")
+
         down_flag, up_flag = {
             "left": (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
             "right": (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
@@ -199,20 +246,21 @@ class Mouse:
         down.union.mi.dwFlags = down_flag
         _send_input(down)
 
-        # Move gradually
-        step_delay = duration / steps
-        for i in range(1, steps + 1):
-            frac = i / steps
-            cx = int(start_x + (end_x - start_x) * frac)
-            cy = int(start_y + (end_y - start_y) * frac)
-            Mouse.move(cx, cy)
-            time.sleep(step_delay)
-
-        # Release
-        up = INPUT()
-        up.type = INPUT_MOUSE
-        up.union.mi.dwFlags = up_flag
-        _send_input(up)
+        # Always release the button, even if a move fails partway through.
+        # Leaving it held would make every later click behave as a drag.
+        try:
+            step_delay = duration / steps
+            for i in range(1, steps + 1):
+                frac = i / steps
+                cx = int(start_x + (end_x - start_x) * frac)
+                cy = int(start_y + (end_y - start_y) * frac)
+                Mouse.move(cx, cy)
+                time.sleep(step_delay)
+        finally:
+            up = INPUT()
+            up.type = INPUT_MOUSE
+            up.union.mi.dwFlags = up_flag
+            _send_input(up)
 
 
 class Keyboard:
@@ -237,18 +285,33 @@ class Keyboard:
 
     @staticmethod
     def _type_char(char: str):
-        """Type a single unicode character."""
-        down = INPUT()
-        down.type = INPUT_KEYBOARD
-        down.union.ki.wScan = ord(char)
-        down.union.ki.dwFlags = KEYEVENTF_UNICODE
+        """
+        Type a single character as one or more UTF-16 code units.
 
-        up = INPUT()
-        up.type = INPUT_KEYBOARD
-        up.union.ki.wScan = ord(char)
-        up.union.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP
+        Characters outside the Basic Multilingual Plane (emoji, rarer CJK) are
+        two UTF-16 code units. `wScan` is a 16-bit field, so sending `ord(char)`
+        directly truncated them into an unrelated character. The surrogate pair
+        is sent as one batch so the halves cannot be separated.
+        """
+        events = []
+        encoded = char.encode("utf-16-le")
+        for i in range(0, len(encoded), 2):
+            unit = encoded[i] | (encoded[i + 1] << 8)
 
-        _send_input(down, up)
+            down = INPUT()
+            down.type = INPUT_KEYBOARD
+            down.union.ki.wScan = unit
+            down.union.ki.dwFlags = KEYEVENTF_UNICODE
+
+            up = INPUT()
+            up.type = INPUT_KEYBOARD
+            up.union.ki.wScan = unit
+            up.union.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP
+
+            events.extend((down, up))
+
+        if events:
+            _send_input(*events)
 
     @staticmethod
     def type_text(text: str, delay: float = 0.02):
@@ -274,26 +337,38 @@ class Keyboard:
         Args:
             key: Key name or combo string (e.g., 'Enter', 'Ctrl+A').
         """
-        parts = [p.strip().lower() for p in key.split("+")]
+        parts = [p.strip().lower() for p in key.split("+") if p.strip()]
+        if not parts:
+            raise ValueError(f"Empty key specification: {key!r}")
+
         modifiers = [p for p in parts if p in MODIFIER_KEYS]
         main_keys = [p for p in parts if p not in MODIFIER_KEYS]
 
+        unknown = [k for k in main_keys if k not in VK_CODES]
+        if unknown:
+            raise ValueError(
+                f"Unknown key(s): {', '.join(unknown)}. "
+                f"Known keys: {', '.join(sorted(VK_CODES))}"
+            )
+
         # Press modifiers down
-        for mod in modifiers:
-            Keyboard._key_down(VK_CODES[mod])
+        pressed = []
+        try:
+            for mod in modifiers:
+                Keyboard._key_down(VK_CODES[mod])
+                pressed.append(mod)
 
-        # Press and release main keys
-        for mk in main_keys:
-            vk = VK_CODES.get(mk)
-            if vk is None:
-                raise ValueError(f"Unknown key: {mk}")
-            Keyboard._key_down(vk)
-            time.sleep(0.01)
-            Keyboard._key_up(vk)
-
-        # Release modifiers in reverse
-        for mod in reversed(modifiers):
-            Keyboard._key_up(VK_CODES[mod])
+            # Press and release main keys
+            for mk in main_keys:
+                vk = VK_CODES[mk]
+                Keyboard._key_down(vk)
+                time.sleep(0.01)
+                Keyboard._key_up(vk)
+        finally:
+            # Release modifiers in reverse, even on failure. A stuck Ctrl or Alt
+            # would corrupt every subsequent keystroke sent to the desktop.
+            for mod in reversed(pressed):
+                Keyboard._key_up(VK_CODES[mod])
 
     @staticmethod
     def hotkey(*keys: str):

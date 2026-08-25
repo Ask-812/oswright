@@ -6,9 +6,9 @@ On Linux: requires X11 display server (Wayland has limited support).
 On macOS: requires Accessibility permissions (System Settings > Privacy > Accessibility).
 """
 
-import time
 import logging
-from typing import Optional, Literal
+import time
+from typing import Literal, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -180,6 +180,11 @@ class Mouse:
         """Drag from one point to another."""
         from pynput.mouse import Button
 
+        if steps < 1:
+            raise ValueError(f"steps must be >= 1 (got {steps})")
+        if duration < 0:
+            raise ValueError(f"duration must be >= 0 (got {duration})")
+
         btn = {
             "left": Button.left,
             "right": Button.right,
@@ -190,16 +195,18 @@ class Mouse:
         time.sleep(0.05)
 
         mouse.press(btn)
-
-        step_delay = duration / steps
-        for i in range(1, steps + 1):
-            frac = i / steps
-            cx = int(start_x + (end_x - start_x) * frac)
-            cy = int(start_y + (end_y - start_y) * frac)
-            Mouse.move(cx, cy)
-            time.sleep(step_delay)
-
-        mouse.release(btn)
+        # Always release, even if a move fails partway through: a stuck button
+        # turns every later click into a drag.
+        try:
+            step_delay = duration / steps
+            for i in range(1, steps + 1):
+                frac = i / steps
+                cx = int(start_x + (end_x - start_x) * frac)
+                cy = int(start_y + (end_y - start_y) * frac)
+                Mouse.move(cx, cy)
+                time.sleep(step_delay)
+        finally:
+            mouse.release(btn)
 
 
 class Keyboard:
@@ -221,24 +228,33 @@ class Keyboard:
         Supports combos like 'Ctrl+C', 'Alt+Tab', 'Ctrl+Shift+S'.
         """
         kbd = _get_keyboard()
-        parts = [p.strip().lower() for p in key.split("+")]
+        parts = [p.strip().lower() for p in key.split("+") if p.strip()]
+        if not parts:
+            raise ValueError(f"Empty key specification: {key!r}")
+
         modifiers = [p for p in parts if p in MODIFIER_KEYS]
         main_keys = [p for p in parts if p not in MODIFIER_KEYS]
 
-        # Press modifiers down
-        for mod in modifiers:
-            kbd.press(_resolve_key(mod))
+        # Resolve everything up front so an unknown key cannot leave a
+        # modifier held down.
+        resolved_mods = [(m, _resolve_key(m)) for m in modifiers]
+        resolved_main = [_resolve_key(k) for k in main_keys]
 
-        # Press and release main keys
-        for mk in main_keys:
-            k = _resolve_key(mk)
-            kbd.press(k)
-            time.sleep(0.01)
-            kbd.release(k)
+        pressed = []
+        try:
+            for _name, k in resolved_mods:
+                kbd.press(k)
+                pressed.append(k)
 
-        # Release modifiers in reverse
-        for mod in reversed(modifiers):
-            kbd.release(_resolve_key(mod))
+            for k in resolved_main:
+                kbd.press(k)
+                time.sleep(0.01)
+                kbd.release(k)
+        finally:
+            # Release modifiers in reverse, even on failure. A stuck Ctrl or Alt
+            # would corrupt every subsequent keystroke sent to the desktop.
+            for k in reversed(pressed):
+                kbd.release(k)
 
     @staticmethod
     def hotkey(*keys: str):

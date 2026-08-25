@@ -12,10 +12,10 @@ Usage:
 """
 
 from oswright.core import OSWright
+from oswright.locator import ElementNotFoundError, Locator, OSWrightError, TimeoutError
 from oswright.screen import Screen
-from oswright.locator import Locator, OSWrightError, ElementNotFoundError, TimeoutError
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 __all__ = [
     "OSWright",
     "Screen",

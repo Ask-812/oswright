@@ -29,15 +29,20 @@ import io
 import json
 import logging
 import os
+import platform
+import shlex
+import subprocess
+import threading
 import time
-from typing import Optional
+from typing import Literal, Optional
 
-from mcp.server.fastmcp import FastMCP, Image as MCPImage
+from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Image as MCPImage
 from mcp.types import ToolAnnotations
 
 from oswright.capture import ScreenCapture
-from oswright.detect import OCREngine, ImageMatcher
-from oswright.input import Mouse, Keyboard
+from oswright.detect import ImageMatcher, OCREngine
+from oswright.input import Keyboard, Mouse
 
 logger = logging.getLogger(__name__)
 
@@ -62,32 +67,249 @@ mcp = FastMCP(
     ),
 )
 
-_capture = ScreenCapture()
+_capture: Optional[ScreenCapture] = None
 _ocr: Optional[OCREngine] = None
+# Separate locks: building the OCR engine can take seconds on EasyOCR, and it
+# must not block an unrelated screenshot.
+_capture_lock = threading.Lock()
+_ocr_lock = threading.Lock()
 _ocr_languages: list[str] = ["en"]
 _default_timeout: float = 10.0
+_default_poll_interval: float = 0.5
+_snapshot_max_width: int = 0  # 0 = full resolution
+
+# There is exactly one physical mouse and keyboard. Without this lock, two
+# concurrent MCP requests can interleave their events — half of one string typed
+# into the middle of another, or a click landing between another tool's
+# select-all and its replacement text.
+_action_lock = threading.RLock()
 
 # --- Tool annotation presets (mirrors Playwright MCP pattern) ---
 _READONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=True)
 _INPUT = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True)
 _ACTION = ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True)
+_READONLY_WAIT = ToolAnnotations(readOnlyHint=True, openWorldHint=True)
+# For actions a user cannot simply undo (closing an app may discard unsaved work).
+_DESTRUCTIVE = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True
+)
+
+
+def _check_save_path(save_path: Optional[str]) -> Optional[str]:
+    """
+    Return a JSON error if writing `save_path` would clobber an existing file.
+
+    These capture tools are advertised as read-only, so they must never
+    silently destroy something already on disk.
+    """
+    if save_path and os.path.exists(save_path):
+        return json.dumps({
+            "error": f"Refusing to overwrite existing file: {save_path}. "
+                     f"Choose a different save_path.",
+        })
+    return None
+
+
+def _get_capture() -> ScreenCapture:
+    """
+    Lazy-init screen capture.
+
+    Deliberately not created at import time: importing the module must not
+    require a usable display, or the server cannot even report a clean error.
+    """
+    global _capture
+    with _capture_lock:
+        if _capture is None:
+            _capture = ScreenCapture()
+        return _capture
 
 
 def _get_ocr() -> OCREngine:
     """Lazy-init OCR engine (heavy first load)."""
     global _ocr
-    if _ocr is None:
-        logger.info("Initializing OCR engine (first use, languages=%s)...", _ocr_languages)
-        _ocr = OCREngine(languages=_ocr_languages)
-    return _ocr
+    with _ocr_lock:
+        if _ocr is None:
+            logger.info("Initializing OCR engine (first use, languages=%s)...", _ocr_languages)
+            _ocr = OCREngine(languages=_ocr_languages)
+        return _ocr
+
+
+def _timeout(value: Optional[float]) -> float:
+    """Resolve a tool's timeout against the server-wide --timeout default."""
+    return _default_timeout if value is None else value
+
+
+def _poll(value: Optional[float]) -> float:
+    """Resolve a tool's poll interval against the server-wide default."""
+    return _default_poll_interval if value is None else value
+
+
+def _region_of(
+    left: Optional[int], top: Optional[int],
+    width: Optional[int], height: Optional[int],
+) -> Optional[dict]:
+    """
+    Build a region dict from four bounds.
+
+    Raises ValueError when only some bounds are given. Previously partial bounds
+    were silently ignored and the whole screen was captured instead — the
+    opposite of what the caller asked for.
+    """
+    supplied = [v is not None for v in (left, top, width, height)]
+    if not any(supplied):
+        return None
+    if not all(supplied):
+        raise ValueError(
+            "A region needs all four of region_left, region_top, region_width "
+            "and region_height."
+        )
+    if width <= 0 or height <= 0:
+        raise ValueError(f"Region size must be positive (got {width}x{height}).")
+    return {"left": left, "top": top, "width": width, "height": height}
+
+
+def _encode_png(img) -> MCPImage:
+    """Encode a PIL image as MCP image content, downscaling if configured."""
+    if _snapshot_max_width and img.width > _snapshot_max_width:
+        from PIL import Image as PILImage
+
+        ratio = _snapshot_max_width / img.width
+        img = img.resize(
+            (_snapshot_max_width, max(1, round(img.height * ratio))),
+            PILImage.LANCZOS,
+        )
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return MCPImage(data=buf.getvalue(), format="png")
 
 
 def _take_snapshot_image() -> MCPImage:
     """Capture a screenshot and return as MCP Image content."""
-    img = _capture.screenshot()
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return MCPImage(data=buf.getvalue(), format="png")
+    return _encode_png(_get_capture().screenshot())
+
+
+def _is_loopback(host: str) -> bool:
+    """True if `host` only accepts connections from this machine."""
+    import ipaddress
+
+    normalized = (host or "").strip().strip("[]").lower()
+    if normalized in ("localhost", ""):
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        # A hostname we cannot classify: treat as remote and require opt-in.
+        return False
+
+
+def _split_command(command: str) -> list[str]:
+    """
+    Split a command string into argv.
+
+    On Windows `shlex.split` in POSIX mode eats backslashes, mangling
+    ``C:\\Windows\\notepad.exe`` into ``C:Windowsnotepad.exe``. Non-POSIX mode
+    preserves them but leaves quotes attached, so strip those afterwards.
+    """
+    if platform.system() == "Windows":
+        parts = shlex.split(command, posix=False)
+        return [
+            p[1:-1] if len(p) >= 2 and p[0] == '"' and p[-1] == '"' else p
+            for p in parts
+        ]
+    return shlex.split(command)
+
+
+def _click_and_replace(match, value: str):
+    """Click a field, clear whatever is in it, and type the new value."""
+    Mouse.click(match.x, match.y)
+    time.sleep(0.1)
+    Keyboard.press("Ctrl+A")
+    time.sleep(0.05)
+    Keyboard.press("Delete")
+    time.sleep(0.05)
+    Keyboard.type_text(value)
+    time.sleep(0.1)
+
+
+def _act_on_text(
+    action: str,
+    text: str,
+    exact: bool,
+    timeout: Optional[float],
+    poll_interval: Optional[float],
+    monitor: int,
+    perform,
+) -> list:
+    """
+    Shared body for the OCR-driven compound tools (click/double/right/hover).
+
+    Keeping one implementation means the coordinate translation and timeout
+    handling cannot drift between them.
+    """
+    with _action_lock:
+        match = _find_text_match(text, exact, timeout, poll_interval, monitor)
+        if match is None:
+            return [json.dumps({
+                "action": action,
+                "error": f"Text '{text}' not found on screen within {_timeout(timeout)}s",
+            })]
+
+        perform(match)
+        time.sleep(0.3)
+
+    return [
+        json.dumps({
+            "action": action,
+            "text_found": match.text,
+            "target": [match.x, match.y],
+            "confidence": round(match.confidence, 3),
+        }),
+        _take_snapshot_image(),
+    ]
+
+
+def _check_xy(x: Optional[int], y: Optional[int]) -> Optional[str]:
+    """
+    Return a JSON error if exactly one of x/y was supplied.
+
+    Silently falling back to "click wherever the cursor happens to be" when the
+    agent supplied only one coordinate would produce a random click.
+    """
+    if (x is None) != (y is None):
+        return json.dumps({
+            "error": f"Provide both x and y, or neither (got x={x}, y={y}).",
+        })
+    return None
+
+
+def _find_text_match(
+    text: str,
+    exact: bool,
+    timeout: Optional[float],
+    poll_interval: Optional[float],
+    monitor: int,
+):
+    """
+    Poll OCR until `text` is found, or the timeout expires.
+
+    Returns the best match already translated into absolute screen coordinates,
+    or None if it never appeared.
+    """
+    timeout = _timeout(timeout)
+    poll_interval = _poll(poll_interval)
+    capture = _get_capture()
+    ocr = _get_ocr()
+    dx, dy = capture.get_offset(monitor=monitor)
+    deadline = time.time() + timeout
+
+    while True:
+        img = capture.screenshot(monitor=monitor)
+        matches = ocr.find_text(img, text, exact=exact)
+        if matches:
+            return matches[0].offset(dx, dy)
+        if time.time() >= deadline:
+            return None
+        time.sleep(poll_interval)
 
 
 # =========================================================================
@@ -117,29 +339,31 @@ def screenshot(
         region_height: Height of the sub-region.
         monitor: Monitor index (0 = all monitors, 1 = primary, etc.).
     """
-    region = None
-    if all(v is not None for v in [region_left, region_top, region_width, region_height]):
-        region = {
-            "left": region_left,
-            "top": region_top,
-            "width": region_width,
-            "height": region_height,
-        }
+    try:
+        region = _region_of(region_left, region_top, region_width, region_height)
+    except ValueError as e:
+        return [json.dumps({"error": str(e)})]
 
-    img = _capture.screenshot(path=save_path, region=region, monitor=monitor)
+    err = _check_save_path(save_path)
+    if err:
+        return [err]
 
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
+    capture = _get_capture()
+    img = capture.screenshot(path=save_path, region=region, monitor=monitor)
+    origin_x, origin_y = capture.get_offset(region=region, monitor=monitor)
 
-    result = [
+    return [
         json.dumps({
             "width": img.size[0],
             "height": img.size[1],
+            # Pixel (0,0) of this image is at this absolute screen coordinate.
+            # Add it to any coordinate you read off the image before clicking.
+            "origin_x": origin_x,
+            "origin_y": origin_y,
             **({"saved_to": save_path} if save_path else {}),
         }),
-        MCPImage(data=buf.getvalue(), format="png"),
+        _encode_png(img),
     ]
-    return result
 
 
 @mcp.tool(annotations=_READONLY)
@@ -150,8 +374,9 @@ def get_screen_info(monitor: int = 0) -> str:
     Args:
         monitor: Monitor index (0 = all monitors combined).
     """
-    size = _capture.get_screen_size(monitor)
-    count = _capture.get_monitor_count()
+    capture = _get_capture()
+    size = capture.get_screen_size(monitor)
+    count = capture.get_monitor_count()
     return json.dumps({"screen_size": size, "monitor_count": count})
 
 
@@ -172,7 +397,8 @@ def find_text_on_screen(
 ) -> str:
     """
     Find all occurrences of text on screen using OCR.
-    Returns a list of matches with coordinates and confidence.
+    Returns a list of matches with coordinates and confidence. Coordinates are
+    absolute screen coordinates, ready to pass straight to mouse_click.
 
     Args:
         text: The text to search for on screen.
@@ -183,36 +409,33 @@ def find_text_on_screen(
         region_height: Optional height to restrict search area.
         monitor: Monitor index.
     """
-    region = None
-    if all(v is not None for v in [region_left, region_top, region_width, region_height]):
-        region = {
-            "left": region_left,
-            "top": region_top,
-            "width": region_width,
-            "height": region_height,
-        }
+    try:
+        region = _region_of(region_left, region_top, region_width, region_height)
+    except ValueError as e:
+        return json.dumps({"query": text, "error": str(e)})
 
-    img = _capture.screenshot(region=region, monitor=monitor)
-    ocr = _get_ocr()
-    matches = ocr.find_text(img, text, exact=exact)
-
-    # Adjust coords if we used a region
-    results = []
-    for m in matches:
-        x_off = region["left"] if region else 0
-        y_off = region["top"] if region else 0
-        results.append({
-            "text": m.text,
-            "x": m.x + x_off,
-            "y": m.y + y_off,
-            "left": m.left + x_off,
-            "top": m.top + y_off,
-            "width": m.width,
-            "height": m.height,
-            "confidence": round(m.confidence, 3),
-        })
+    capture = _get_capture()
+    img = capture.screenshot(region=region, monitor=monitor)
+    matches = _get_ocr().find_text(img, text, exact=exact)
+    # Translate to absolute screen coordinates (region offset + monitor origin).
+    dx, dy = capture.get_offset(region=region, monitor=monitor)
+    results = [_match_to_dict(m.offset(dx, dy)) for m in matches]
 
     return json.dumps({"query": text, "match_count": len(results), "matches": results})
+
+
+def _match_to_dict(m) -> dict:
+    """Serialise an ElementMatch for a tool response."""
+    return {
+        "text": m.text,
+        "x": m.x,
+        "y": m.y,
+        "left": m.left,
+        "top": m.top,
+        "width": m.width,
+        "height": m.height,
+        "confidence": round(m.confidence, 3),
+    }
 
 
 @mcp.tool(annotations=_READONLY)
@@ -225,7 +448,8 @@ def read_screen_text(
 ) -> str:
     """
     Read ALL visible text on the screen using OCR.
-    Returns every detected text element with its position.
+    Returns every detected text element with its position, in absolute
+    screen coordinates that are ready to click.
 
     Args:
         region_left: Optional left bound to restrict OCR area.
@@ -234,34 +458,17 @@ def read_screen_text(
         region_height: Optional height to restrict OCR area.
         monitor: Monitor index.
     """
-    region = None
-    if all(v is not None for v in [region_left, region_top, region_width, region_height]):
-        region = {
-            "left": region_left,
-            "top": region_top,
-            "width": region_width,
-            "height": region_height,
-        }
+    try:
+        region = _region_of(region_left, region_top, region_width, region_height)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
 
-    img = _capture.screenshot(region=region, monitor=monitor)
-    ocr = _get_ocr()
-    elements = ocr.read_all(img)
+    capture = _get_capture()
+    img = capture.screenshot(region=region, monitor=monitor)
+    elements = _get_ocr().read_all(img)
 
-    x_off = region["left"] if region else 0
-    y_off = region["top"] if region else 0
-
-    results = []
-    for el in elements:
-        results.append({
-            "text": el.text,
-            "x": el.x + x_off,
-            "y": el.y + y_off,
-            "left": el.left + x_off,
-            "top": el.top + y_off,
-            "width": el.width,
-            "height": el.height,
-            "confidence": round(el.confidence, 3),
-        })
+    dx, dy = capture.get_offset(region=region, monitor=monitor)
+    results = [_match_to_dict(el.offset(dx, dy)) for el in elements]
 
     return json.dumps({"element_count": len(results), "elements": results})
 
@@ -279,17 +486,23 @@ def find_image_on_screen(
 ) -> str:
     """
     Find all occurrences of a template image on screen.
+    Coordinates are absolute screen coordinates, ready to pass to mouse_click.
 
     Args:
         template_path: Absolute path to the template image file to find.
         threshold: Minimum match confidence (0.0-1.0, default 0.8).
         monitor: Monitor index.
     """
-    img = _capture.screenshot(monitor=monitor)
-    matches = ImageMatcher.find_image(img, template_path, threshold=threshold)
+    capture = _get_capture()
+    img = capture.screenshot(monitor=monitor)
+    try:
+        matches = ImageMatcher.find_image(img, template_path, threshold=threshold)
+    except (FileNotFoundError, ValueError) as e:
+        return json.dumps({"template": template_path, "error": str(e)})
 
+    dx, dy = capture.get_offset(monitor=monitor)
     results = []
-    for m in matches:
+    for m in (m.offset(dx, dy) for m in matches):
         results.append({
             "x": m.x, "y": m.y,
             "left": m.left, "top": m.top,
@@ -313,7 +526,7 @@ def find_image_on_screen(
 def mouse_click(
     x: Optional[int] = None,
     y: Optional[int] = None,
-    button: str = "left",
+    button: Literal["left", "right", "middle"] = "left",
     clicks: int = 1,
 ) -> list:
     """
@@ -326,6 +539,10 @@ def mouse_click(
         button: Mouse button - 'left', 'right', or 'middle'.
         clicks: Number of clicks (2 for double-click).
     """
+    err = _check_xy(x, y)
+    if err:
+        return [err]
+
     Mouse.click(x, y, button=button, clicks=clicks)
     time.sleep(0.3)
     pos = Mouse.get_position()
@@ -345,6 +562,10 @@ def mouse_double_click(x: Optional[int] = None, y: Optional[int] = None) -> list
         x: X screen coordinate.
         y: Y screen coordinate.
     """
+    err = _check_xy(x, y)
+    if err:
+        return [err]
+
     Mouse.double_click(x, y)
     time.sleep(0.3)
     pos = Mouse.get_position()
@@ -473,9 +694,9 @@ def press_key(key: str) -> list:
 def click_text(
     text: str,
     exact: bool = False,
-    button: str = "left",
-    timeout: float = 10.0,
-    poll_interval: float = 0.5,
+    button: Literal["left", "right", "middle"] = "left",
+    timeout: Optional[float] = None,
+    poll_interval: Optional[float] = None,
     monitor: int = 0,
 ) -> list:
     """
@@ -487,137 +708,22 @@ def click_text(
         exact: Require exact text match (not just substring).
         button: Mouse button ('left', 'right', 'middle').
         timeout: Maximum seconds to wait for the text to appear.
+                 Defaults to the server's --timeout setting.
         poll_interval: Seconds between each retry.
         monitor: Monitor index.
     """
-    deadline = time.time() + timeout
-    ocr = _get_ocr()
-
-    while True:
-        img = _capture.screenshot(monitor=monitor)
-        matches = ocr.find_text(img, text, exact=exact)
-
-        if matches:
-            best = matches[0]
-            Mouse.click(best.x, best.y, button=button)
-            time.sleep(0.3)
-            return [
-                json.dumps({
-                    "action": "click_text",
-                    "text_found": best.text,
-                    "clicked_at": [best.x, best.y],
-                    "confidence": round(best.confidence, 3),
-                }),
-                _take_snapshot_image(),
-            ]
-
-        if time.time() >= deadline:
-            return [json.dumps({
-                "action": "click_text",
-                "error": f"Text '{text}' not found on screen within {timeout}s",
-            })]
-
-        time.sleep(poll_interval)
-
-
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True))
-def wait_for_text(
-    text: str,
-    exact: bool = False,
-    timeout: float = 10.0,
-    poll_interval: float = 0.5,
-    monitor: int = 0,
-) -> str:
-    """
-    Wait for specific text to appear on screen. Polls via OCR until found or timeout.
-
-    Args:
-        text: The text to wait for.
-        exact: Require exact match.
-        timeout: Maximum seconds to wait.
-        poll_interval: Seconds between polls.
-        monitor: Monitor index.
-    """
-    deadline = time.time() + timeout
-    ocr = _get_ocr()
-
-    while True:
-        img = _capture.screenshot(monitor=monitor)
-        matches = ocr.find_text(img, text, exact=exact)
-
-        if matches:
-            best = matches[0]
-            return json.dumps({
-                "found": True,
-                "text": best.text,
-                "x": best.x, "y": best.y,
-                "confidence": round(best.confidence, 3),
-            })
-
-        if time.time() >= deadline:
-            return json.dumps({
-                "found": False,
-                "error": f"Text '{text}' not found within {timeout}s",
-            })
-
-        time.sleep(poll_interval)
-
-
-@mcp.tool(annotations=_INPUT)
-def fill_field(
-    target_text: str,
-    value: str,
-    exact: bool = False,
-    timeout: float = 10.0,
-    monitor: int = 0,
-) -> list:
-    """
-    Find a text label on screen, click it, clear the field, and type a value.
-    Useful for filling form fields by their label text.
-    Returns action result and a screenshot of current screen state.
-
-    Args:
-        target_text: The label text to find and click.
-        value: The text to type into the field.
-        exact: Require exact text match for the label.
-        timeout: Maximum seconds to wait for the label.
-        monitor: Monitor index.
-    """
-    # First find and click the target
-    result = json.loads(click_text(target_text, exact=exact, timeout=timeout, monitor=monitor)[0])
-    if "error" in result:
-        return [json.dumps({"action": "fill_field", "error": result["error"]})]
-
-    time.sleep(0.1)
-    Keyboard.press("Ctrl+A")
-    time.sleep(0.05)
-    Keyboard.press("Delete")
-    time.sleep(0.05)
-    Keyboard.type_text(value)
-    time.sleep(0.2)
-
-    return [
-        json.dumps({
-            "action": "fill_field",
-            "target": target_text,
-            "value": value,
-            "clicked_at": result["clicked_at"],
-        }),
-        _take_snapshot_image(),
-    ]
-
-
-# =========================================================================
-# NEW COMPOUND TOOLS (inspired by Playwright MCP patterns)
-# =========================================================================
+    return _act_on_text(
+        "click_text", text, exact, timeout, poll_interval, monitor,
+        lambda m: Mouse.click(m.x, m.y, button=button),
+    )
 
 
 @mcp.tool(annotations=_INPUT)
 def double_click_text(
     text: str,
     exact: bool = False,
-    timeout: float = 10.0,
-    poll_interval: float = 0.5,
+    timeout: Optional[float] = None,
+    poll_interval: Optional[float] = None,
     monitor: int = 0,
 ) -> list:
     """
@@ -631,42 +737,18 @@ def double_click_text(
         poll_interval: Seconds between each retry.
         monitor: Monitor index.
     """
-    deadline = time.time() + timeout
-    ocr = _get_ocr()
-
-    while True:
-        img = _capture.screenshot(monitor=monitor)
-        matches = ocr.find_text(img, text, exact=exact)
-
-        if matches:
-            best = matches[0]
-            Mouse.double_click(best.x, best.y)
-            time.sleep(0.3)
-            return [
-                json.dumps({
-                    "action": "double_click_text",
-                    "text_found": best.text,
-                    "clicked_at": [best.x, best.y],
-                    "confidence": round(best.confidence, 3),
-                }),
-                _take_snapshot_image(),
-            ]
-
-        if time.time() >= deadline:
-            return [json.dumps({
-                "action": "double_click_text",
-                "error": f"Text '{text}' not found on screen within {timeout}s",
-            })]
-
-        time.sleep(poll_interval)
+    return _act_on_text(
+        "double_click_text", text, exact, timeout, poll_interval, monitor,
+        lambda m: Mouse.double_click(m.x, m.y),
+    )
 
 
 @mcp.tool(annotations=_INPUT)
 def right_click_text(
     text: str,
     exact: bool = False,
-    timeout: float = 10.0,
-    poll_interval: float = 0.5,
+    timeout: Optional[float] = None,
+    poll_interval: Optional[float] = None,
     monitor: int = 0,
 ) -> list:
     """
@@ -680,42 +762,18 @@ def right_click_text(
         poll_interval: Seconds between each retry.
         monitor: Monitor index.
     """
-    deadline = time.time() + timeout
-    ocr = _get_ocr()
-
-    while True:
-        img = _capture.screenshot(monitor=monitor)
-        matches = ocr.find_text(img, text, exact=exact)
-
-        if matches:
-            best = matches[0]
-            Mouse.click(best.x, best.y, button="right")
-            time.sleep(0.3)
-            return [
-                json.dumps({
-                    "action": "right_click_text",
-                    "text_found": best.text,
-                    "clicked_at": [best.x, best.y],
-                    "confidence": round(best.confidence, 3),
-                }),
-                _take_snapshot_image(),
-            ]
-
-        if time.time() >= deadline:
-            return [json.dumps({
-                "action": "right_click_text",
-                "error": f"Text '{text}' not found on screen within {timeout}s",
-            })]
-
-        time.sleep(poll_interval)
+    return _act_on_text(
+        "right_click_text", text, exact, timeout, poll_interval, monitor,
+        lambda m: Mouse.click(m.x, m.y, button="right"),
+    )
 
 
 @mcp.tool(annotations=_INPUT)
 def hover_text(
     text: str,
     exact: bool = False,
-    timeout: float = 10.0,
-    poll_interval: float = 0.5,
+    timeout: Optional[float] = None,
+    poll_interval: Optional[float] = None,
     monitor: int = 0,
 ) -> list:
     """
@@ -730,42 +788,50 @@ def hover_text(
         poll_interval: Seconds between each retry.
         monitor: Monitor index.
     """
-    deadline = time.time() + timeout
-    ocr = _get_ocr()
-
-    while True:
-        img = _capture.screenshot(monitor=monitor)
-        matches = ocr.find_text(img, text, exact=exact)
-
-        if matches:
-            best = matches[0]
-            Mouse.move(best.x, best.y)
-            time.sleep(0.3)
-            return [
-                json.dumps({
-                    "action": "hover_text",
-                    "text_found": best.text,
-                    "hovered_at": [best.x, best.y],
-                    "confidence": round(best.confidence, 3),
-                }),
-                _take_snapshot_image(),
-            ]
-
-        if time.time() >= deadline:
-            return [json.dumps({
-                "action": "hover_text",
-                "error": f"Text '{text}' not found on screen within {timeout}s",
-            })]
-
-        time.sleep(poll_interval)
+    return _act_on_text(
+        "hover_text", text, exact, timeout, poll_interval, monitor,
+        lambda m: Mouse.move(m.x, m.y),
+    )
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True))
+@mcp.tool(annotations=_READONLY_WAIT)
+def wait_for_text(
+    text: str,
+    exact: bool = False,
+    timeout: Optional[float] = None,
+    poll_interval: Optional[float] = None,
+    monitor: int = 0,
+) -> str:
+    """
+    Wait for specific text to appear on screen. Polls via OCR until found or timeout.
+
+    Args:
+        text: The text to wait for.
+        exact: Require exact match.
+        timeout: Maximum seconds to wait. Defaults to the server's --timeout.
+        poll_interval: Seconds between polls.
+        monitor: Monitor index.
+    """
+    match = _find_text_match(text, exact, timeout, poll_interval, monitor)
+    if match is None:
+        return json.dumps({
+            "found": False,
+            "error": f"Text '{text}' not found within {_timeout(timeout)}s",
+        })
+    return json.dumps({
+        "found": True,
+        "text": match.text,
+        "x": match.x, "y": match.y,
+        "confidence": round(match.confidence, 3),
+    })
+
+
+@mcp.tool(annotations=_READONLY_WAIT)
 def wait_for_text_gone(
     text: str,
     exact: bool = False,
-    timeout: float = 10.0,
-    poll_interval: float = 0.5,
+    timeout: Optional[float] = None,
+    poll_interval: Optional[float] = None,
     monitor: int = 0,
 ) -> str:
     """
@@ -775,27 +841,70 @@ def wait_for_text_gone(
     Args:
         text: The text to wait to disappear.
         exact: Require exact match.
-        timeout: Maximum seconds to wait.
+        timeout: Maximum seconds to wait. Defaults to the server's --timeout.
         poll_interval: Seconds between polls.
         monitor: Monitor index.
     """
-    deadline = time.time() + timeout
+    resolved_timeout = _timeout(timeout)
+    interval = _poll(poll_interval)
+    capture = _get_capture()
     ocr = _get_ocr()
+    deadline = time.time() + resolved_timeout
 
     while True:
-        img = _capture.screenshot(monitor=monitor)
-        matches = ocr.find_text(img, text, exact=exact)
-
-        if not matches:
+        img = capture.screenshot(monitor=monitor)
+        if not ocr.find_text(img, text, exact=exact):
             return json.dumps({"gone": True, "text": text})
 
         if time.time() >= deadline:
             return json.dumps({
                 "gone": False,
-                "error": f"Text '{text}' still visible after {timeout}s",
+                "error": f"Text '{text}' still visible after {resolved_timeout}s",
             })
 
-        time.sleep(poll_interval)
+        time.sleep(interval)
+
+
+@mcp.tool(annotations=_INPUT)
+def fill_field(
+    target_text: str,
+    value: str,
+    exact: bool = False,
+    timeout: Optional[float] = None,
+    monitor: int = 0,
+) -> list:
+    """
+    Find a text label on screen, click it, clear the field, and type a value.
+    Useful for filling form fields by their label text.
+    Returns action result and a screenshot of current screen state.
+
+    Args:
+        target_text: The label text to find and click.
+        value: The text to type into the field.
+        exact: Require exact text match for the label.
+        timeout: Maximum seconds to wait for the label.
+        monitor: Monitor index.
+    """
+    with _action_lock:
+        match = _find_text_match(target_text, exact, timeout, None, monitor)
+        if match is None:
+            return [json.dumps({
+                "action": "fill_field",
+                "error": f"Text '{target_text}' not found on screen within "
+                         f"{_timeout(timeout)}s",
+            })]
+
+        _click_and_replace(match, value)
+
+    return [
+        json.dumps({
+            "action": "fill_field",
+            "target": target_text,
+            "value": value,
+            "clicked_at": [match.x, match.y],
+        }),
+        _take_snapshot_image(),
+    ]
 
 
 @mcp.tool(annotations=ToolAnnotations(
@@ -810,7 +919,7 @@ def wait_for_time(seconds: float) -> list:
     Args:
         seconds: Number of seconds to wait (max 30).
     """
-    seconds = min(seconds, 30.0)
+    seconds = max(0.0, min(seconds, 30.0))
     time.sleep(seconds)
     return [
         json.dumps({"action": "wait", "waited_seconds": seconds}),
@@ -821,7 +930,7 @@ def wait_for_time(seconds: float) -> list:
 @mcp.tool(annotations=_INPUT)
 def fill_form(
     fields: list[dict],
-    timeout: float = 10.0,
+    timeout: Optional[float] = None,
     monitor: int = 0,
 ) -> list:
     """
@@ -837,39 +946,28 @@ def fill_form(
     """
     filled = []
     errors = []
-    ocr = _get_ocr()
 
-    for field in fields:
-        if not isinstance(field, dict) or "label" not in field or "value" not in field:
-            errors.append({"label": str(field), "error": "Each field must have 'label' and 'value' keys"})
-            continue
+    # Held across every field so another request cannot type into the middle of
+    # this form.
+    with _action_lock:
+        for field in fields:
+            if not isinstance(field, dict) or "label" not in field or "value" not in field:
+                errors.append({
+                    "label": str(field),
+                    "error": "Each field must have 'label' and 'value' keys",
+                })
+                continue
 
-        label = field["label"]
-        value = field["value"]
+            label = field["label"]
+            value = field["value"]
 
-        deadline = time.time() + timeout
-        while True:
-            img = _capture.screenshot(monitor=monitor)
-            matches = ocr.find_text(img, label)
-
-            if matches:
-                best = matches[0]
-                Mouse.click(best.x, best.y)
-                time.sleep(0.1)
-                Keyboard.press("Ctrl+A")
-                time.sleep(0.05)
-                Keyboard.press("Delete")
-                time.sleep(0.05)
-                Keyboard.type_text(value)
-                time.sleep(0.1)
-                filled.append({"label": label, "value": value, "at": [best.x, best.y]})
-                break
-
-            if time.time() >= deadline:
+            match = _find_text_match(label, False, timeout, None, monitor)
+            if match is None:
                 errors.append({"label": label, "error": f"Label '{label}' not found"})
-                break
+                continue
 
-            time.sleep(0.5)
+            _click_and_replace(match, value)
+            filled.append({"label": label, "value": value, "at": [match.x, match.y]})
 
     result = {"action": "fill_form", "filled": filled}
     if errors:
@@ -941,10 +1039,11 @@ def focus_window(title: str) -> list:
     return [json.dumps({"action": "focus_window", "error": f"Window '{title}' not found"})]
 
 
-@mcp.tool(annotations=_ACTION)
+@mcp.tool(annotations=_DESTRUCTIVE)
 def close_window(title: str) -> list:
     """
     Close a window by its title (substring match). Sends WM_CLOSE.
+    This may discard unsaved work in the target application.
     Returns action result and a screenshot.
 
     Args:
@@ -1002,22 +1101,30 @@ def screenshot_window(title: str, save_path: Optional[str] = None) -> list:
     """
     from oswright.window import get_window_region
 
+    err = _check_save_path(save_path)
+    if err:
+        return [err]
+
     region = get_window_region(title=title)
     if region is None:
-        return [json.dumps({"error": f"Window '{title}' not found"})]
+        return [json.dumps({
+            "error": f"Window '{title}' not found, or it is minimized and has "
+                     f"nothing to capture. Use focus_window first."
+        })]
 
-    img = _capture.screenshot(path=save_path, region=region)
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
+    img = _get_capture().screenshot(path=save_path, region=region)
 
     return [
         json.dumps({
             "window": title,
             "width": img.size[0],
             "height": img.size[1],
+            # Pixel (0,0) of this image maps here on the virtual screen.
+            "origin_x": region["left"],
+            "origin_y": region["top"],
             **({"saved_to": save_path} if save_path else {}),
         }),
-        MCPImage(data=buf.getvalue(), format="png"),
+        _encode_png(img),
     ]
 
 
@@ -1057,57 +1164,74 @@ def set_clipboard(text: str) -> str:
 # =========================================================================
 
 
-@mcp.tool(annotations=_ACTION)
-def launch_app(command: str, wait_text: Optional[str] = None, timeout: float = 10.0) -> list:
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True,
+))
+def launch_app(
+    command: str,
+    args: Optional[list[str]] = None,
+    wait_text: Optional[str] = None,
+    timeout: Optional[float] = None,
+) -> list:
     """
-    Launch an application by command name. Optionally wait for specific text
-    to appear on screen (indicating the app has loaded).
-    Returns a screenshot after launch.
+    Launch an application. Optionally wait for specific text to appear on
+    screen (indicating the app has loaded). Returns a screenshot after launch.
+
+    The command is executed directly, never through a shell, so shell syntax
+    (pipes, redirection, chaining) is not interpreted and not available.
 
     Args:
-        command: Application name or path to launch (e.g., 'notepad', 'calc', 'code').
-                 Shell operators (|, &, ;, >, <) are not allowed.
+        command: Application name or full path (e.g. 'notepad', 'calc',
+                 r'C:\\Windows\\System32\\notepad.exe').
+        args: Optional argument list. Prefer this over embedding arguments in
+              `command`, since it needs no quoting at all.
         wait_text: Optional text to wait for after launch (e.g., the app title).
-        timeout: How long to wait for wait_text to appear (default: 10s).
+        timeout: How long to wait for wait_text to appear.
     """
-    import subprocess
-    import shlex
-    import platform
+    if not command or not command.strip():
+        return [json.dumps({"action": "launch_app", "error": "command must not be empty"})]
 
-    # Reject shell metacharacters to prevent command injection
-    shell_chars = set('|&;><`$(){}\\\n')
-    if any(c in shell_chars for c in command):
+    # No shell metacharacter blocklist: with shell=False nothing interprets
+    # them, so they cannot inject anything. The old blocklist included the
+    # backslash, which rejected every absolute Windows path.
+    if args is not None:
+        argv = [command, *args]
+    else:
+        try:
+            argv = _split_command(command)
+        except ValueError as e:
+            return [json.dumps({"action": "launch_app", "error": str(e)})]
+
+    if not argv:
+        return [json.dumps({"action": "launch_app", "error": "command must not be empty"})]
+
+    try:
+        if platform.system() == "Windows":
+            proc = subprocess.Popen(argv, shell=False)
+        else:
+            proc = subprocess.Popen(argv, shell=False, start_new_session=True)
+    except (OSError, ValueError) as e:
         return [json.dumps({
             "action": "launch_app",
-            "error": "Shell metacharacters are not allowed in command. Use a simple app name or path.",
+            "command": command,
+            "error": f"Could not launch: {e}",
         })]
-
-    _sys = platform.system()
-
-    if _sys == "Windows":
-        # Use shell=False with a simple command split
-        subprocess.Popen(command.split(), shell=False)
-    else:
-        subprocess.Popen(shlex.split(command), start_new_session=True)
 
     time.sleep(1)  # Give the app a moment to start
 
-    # Optionally wait for text to appear
+    found = None
     if wait_text:
-        ocr = _get_ocr()
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            img = _capture.screenshot()
-            matches = ocr.find_text(img, wait_text)
-            if matches:
-                break
-            time.sleep(0.5)
+        found = _find_text_match(wait_text, False, timeout, None, 0) is not None
 
     return [
         json.dumps({
             "action": "launch_app",
             "command": command,
-            **({"waited_for": wait_text} if wait_text else {}),
+            "argv": argv,
+            "pid": proc.pid,
+            # Report whether the text actually appeared, rather than implying
+            # success just because a wait was requested.
+            **({"wait_text": wait_text, "wait_text_found": found} if wait_text else {}),
         }),
         _take_snapshot_image(),
     ]
@@ -1151,9 +1275,9 @@ def get_ui_tree(window_title: Optional[str] = None, max_depth: int = 8) -> str:
 
     Args:
         window_title: Optional window title to inspect (default: focused window).
-        max_depth: How deep to walk the UI tree (default: 4).
+        max_depth: How deep to walk the UI tree (default: 8).
     """
-    from oswright.accessibility import is_available, find_all_elements
+    from oswright.accessibility import find_all_elements, is_available
 
     if not is_available():
         return json.dumps({
@@ -1188,7 +1312,7 @@ def click_ui_element(
         automation_id: Element automation ID (exact match, if known from get_ui_tree).
         window_title: Target a specific window.
     """
-    from oswright.accessibility import is_available, click_element
+    from oswright.accessibility import click_element, is_available
 
     if not is_available():
         return [json.dumps({"error": "UI Automation not available (Windows only)"})]
@@ -1263,8 +1387,9 @@ def get_active_window() -> str:
     Get information about the currently active/focused window.
     Returns the window title, position, size, and process name.
     """
-    from oswright.window import list_windows as _list_windows
     import platform
+
+    from oswright.window import list_windows as _list_windows
 
     if platform.system() == "Windows":
         import ctypes
@@ -1303,7 +1428,9 @@ def get_active_window() -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True))
-def wait_for_change(timeout: float = 10.0, poll_interval: float = 0.5) -> list:
+def wait_for_change(
+    timeout: Optional[float] = None, poll_interval: Optional[float] = None
+) -> list:
     """
     Wait for the screen to visually change. Takes a baseline screenshot,
     then polls until the screen looks different (or timeout).
@@ -1313,48 +1440,49 @@ def wait_for_change(timeout: float = 10.0, poll_interval: float = 0.5) -> list:
         timeout: Maximum seconds to wait for a change.
         poll_interval: Seconds between polls.
     """
-    from oswright.cache import images_differ, get_diff_region
+    from oswright.cache import get_diff_region, images_differ
 
-    baseline = _capture.screenshot()
-    deadline = time.time() + timeout
+    resolved_timeout = _timeout(timeout)
+    interval = _poll(poll_interval)
+    capture = _get_capture()
+
+    baseline = capture.screenshot()
+    deadline = time.time() + resolved_timeout
 
     while time.time() < deadline:
-        time.sleep(poll_interval)
-        current = _capture.screenshot()
+        time.sleep(interval)
+        current = capture.screenshot()
 
         if images_differ(baseline, current):
-            diff = get_diff_region(baseline, current)
-            buf = io.BytesIO()
-            current.save(buf, format="PNG")
             return [
                 json.dumps({
                     "changed": True,
-                    "diff_region": diff,
+                    "diff_region": get_diff_region(baseline, current),
                 }),
-                MCPImage(data=buf.getvalue(), format="png"),
+                _encode_png(current),
             ]
 
     return [json.dumps({
         "changed": False,
-        "error": f"Screen did not change within {timeout}s",
+        "error": f"Screen did not change within {resolved_timeout}s",
     })]
 
 
 def main():
     """Run the OSWright MCP server."""
-    global _ocr_languages, _default_timeout
+    global _ocr_languages, _default_timeout, _snapshot_max_width
 
     parser = argparse.ArgumentParser(
         prog="oswright",
-        description="OSWright MCP Server — Playwright-like OS automation for AI agents.",
+        description="OSWright MCP Server - Playwright-like OS automation for AI agents.",
     )
     parser.add_argument(
         "--port", type=int, default=None,
         help="Port for SSE transport. If omitted, uses stdio (default for most MCP clients).",
     )
     parser.add_argument(
-        "--host", type=str, default="localhost",
-        help="Host to bind SSE server to. Default: localhost. Use 0.0.0.0 for all interfaces.",
+        "--host", type=str, default=None,
+        help="Host to bind the HTTP/SSE server to. Default: 127.0.0.1 (local only).",
     )
     parser.add_argument(
         "--transport", type=str, default=None,
@@ -1370,25 +1498,56 @@ def main():
         help="Default timeout in seconds for auto-wait operations (default: 10).",
     )
     parser.add_argument(
-        "--log-level", type=str, default="INFO",
+        "--snapshot-max-width", type=int, default=None,
+        help=(
+            "Downscale the auto-snapshot returned by action tools to at most this "
+            "width. 0 (default) keeps full resolution. Lower values cut token cost "
+            "substantially; coordinates from OCR tools stay in real screen pixels."
+        ),
+    )
+    parser.add_argument(
+        "--allow-remote", action="store_true",
+        help=(
+            "Permit binding to a non-loopback address. OSWright has no "
+            "authentication, and exposing it grants full control of this desktop "
+            "to anyone who can reach the port."
+        ),
+    )
+    parser.add_argument(
+        "--log-level", type=str, default=None,
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging level (default: INFO).",
     )
 
     args = parser.parse_args()
 
-    # Also read from environment variables (env takes precedence if CLI not set)
+    # For every setting: an explicit CLI flag wins, otherwise the environment
+    # variable, otherwise the built-in default. --log-level used to be handled
+    # the other way round, so the environment silently overrode the flag.
     if args.ocr_languages:
         _ocr_languages = args.ocr_languages
     elif os.environ.get("OSWRIGHT_OCR_LANGUAGES"):
-        _ocr_languages = os.environ["OSWRIGHT_OCR_LANGUAGES"].split(",")
+        _ocr_languages = [
+            lang.strip()
+            for lang in os.environ["OSWRIGHT_OCR_LANGUAGES"].replace(",", " ").split()
+            if lang.strip()
+        ]
 
     if args.timeout is not None:
         _default_timeout = args.timeout
     elif os.environ.get("OSWRIGHT_TIMEOUT"):
         _default_timeout = float(os.environ["OSWRIGHT_TIMEOUT"])
 
-    log_level = os.environ.get("OSWRIGHT_LOG_LEVEL", args.log_level).upper()
+    if args.snapshot_max_width is not None:
+        _snapshot_max_width = max(0, args.snapshot_max_width)
+    elif os.environ.get("OSWRIGHT_SNAPSHOT_MAX_WIDTH"):
+        _snapshot_max_width = max(0, int(os.environ["OSWRIGHT_SNAPSHOT_MAX_WIDTH"]))
+
+    log_level = (
+        args.log_level
+        or os.environ.get("OSWRIGHT_LOG_LEVEL")
+        or "INFO"
+    ).upper()
     logging.basicConfig(
         level=getattr(logging, log_level, logging.INFO),
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
@@ -1399,13 +1558,34 @@ def main():
     if transport is None:
         transport = "sse" if args.port else "stdio"
 
-    if args.port:
-        os.environ["FASTMCP_PORT"] = str(args.port)
-        os.environ["FASTMCP_HOST"] = args.host
+    host = args.host or os.environ.get("FASTMCP_HOST") or "127.0.0.1"
+
+    if transport != "stdio":
+        if not _is_loopback(host) and not args.allow_remote:
+            parser.error(
+                f"Refusing to bind to {host}: OSWright exposes full keyboard, "
+                f"mouse, screen and clipboard control with no authentication. "
+                f"Anyone who can reach that port can take over this machine. "
+                f"Bind to 127.0.0.1 and use an SSH tunnel, or pass --allow-remote "
+                f"if you genuinely intend this."
+            )
+        if not _is_loopback(host):
+            logger.warning(
+                "OSWright is listening on %s with NO AUTHENTICATION. Any host that "
+                "can reach this port has full control of this desktop.", host,
+            )
+
+        # These must be applied to the live settings object. Setting the
+        # environment variables here has no effect, because FastMCP already read
+        # them when it was constructed at import time.
+        mcp.settings.host = host
+        if args.port:
+            mcp.settings.port = args.port
 
     logger.info(
-        "Starting OSWright MCP server (transport=%s, ocr=%s, timeout=%.1fs)",
+        "Starting OSWright MCP server (transport=%s, ocr=%s, timeout=%.1fs%s)",
         transport, _ocr_languages, _default_timeout,
+        f", bind={host}:{mcp.settings.port}" if transport != "stdio" else "",
     )
 
     mcp.run(transport=transport)

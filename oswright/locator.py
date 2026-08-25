@@ -8,13 +8,14 @@ They auto-wait for elements to appear before acting.
 import builtins
 import logging
 import time
-from typing import Optional, Literal
+from collections.abc import Callable
+from typing import Literal, Optional
 
 from PIL import Image
 
 from oswright.capture import ScreenCapture
-from oswright.detect import OCREngine, ImageMatcher, ElementMatch
-from oswright.input import Mouse, Keyboard
+from oswright.detect import ElementMatch, ImageMatcher, OCREngine
+from oswright.input import Keyboard, Mouse
 
 logger = logging.getLogger(__name__)
 
@@ -47,10 +48,15 @@ class Locator:
         screen.locator(text="Submit").expect().to_be_visible()
     """
 
+    # Errors that will never resolve by retrying — a missing template file or a
+    # locator with no search criteria is a programming error, not a slow UI.
+    # Raise these immediately instead of burning the full timeout first.
+    _FATAL_ERRORS = (FileNotFoundError, ValueError, OSWrightError)
+
     def __init__(
         self,
         capture: ScreenCapture,
-        ocr: OCREngine,
+        ocr: Optional[OCREngine] = None,
         text: Optional[str] = None,
         image: Optional[str] = None,
         image_obj: Optional[Image.Image] = None,
@@ -60,9 +66,16 @@ class Locator:
         region: Optional[dict] = None,
         monitor: int = 0,
         nth: int = 0,
+        ocr_provider: Optional[Callable[[], OCREngine]] = None,
     ):
+        if text is None and image is None and image_obj is None:
+            raise OSWrightError(
+                "Locator needs search criteria: pass text=..., image=..., or image_obj=..."
+            )
+
         self._capture = capture
         self._ocr = ocr
+        self._ocr_provider = ocr_provider
         self._text = text
         self._image = image
         self._image_obj = image_obj
@@ -72,6 +85,19 @@ class Locator:
         self._region = region
         self._monitor = monitor
         self._nth = nth
+
+    def _get_ocr(self) -> OCREngine:
+        """
+        Resolve the OCR engine, only when a text selector actually needs it.
+
+        Image locators never touch this, so template matching keeps working on
+        a machine with no OCR backend installed at all.
+        """
+        if self._ocr is None:
+            if self._ocr_provider is None:
+                raise OSWrightError("This locator has no OCR engine configured")
+            self._ocr = self._ocr_provider()
+        return self._ocr
 
     def _resolve(self, timeout: Optional[float] = None) -> ElementMatch:
         """
@@ -89,24 +115,20 @@ class Locator:
                     region=self._region, monitor=self._monitor
                 )
                 matches = self._find_matches(screenshot)
+                selected = self._select(matches)
 
-                if matches:
-                    # Handle negative indices (e.g., last() uses nth(-1))
-                    idx = self._nth
-                    if idx < 0:
-                        idx = len(matches) + idx
-                    if 0 <= idx < len(matches):
-                        match = matches[idx]
+                if selected is not None:
+                    # Translate image-relative coordinates into absolute screen
+                    # coordinates. This accounts for both a sub-region and a
+                    # monitor origin (the virtual screen can start at a negative
+                    # coordinate on multi-monitor setups).
+                    dx, dy = self._capture.get_offset(
+                        region=self._region, monitor=self._monitor
+                    )
+                    return selected.offset(dx, dy)
 
-                        # Adjust coordinates if using a sub-region
-                        if self._region:
-                            match.x += self._region["left"]
-                            match.y += self._region["top"]
-                            match.left += self._region["left"]
-                            match.top += self._region["top"]
-
-                        return match
-
+            except self._FATAL_ERRORS:
+                raise
             except Exception as e:
                 last_error = e
 
@@ -120,10 +142,21 @@ class Locator:
 
             time.sleep(self._poll_interval)
 
+    def _select(self, matches: list[ElementMatch]) -> Optional[ElementMatch]:
+        """Pick this locator's nth match, supporting negative indices."""
+        if not matches:
+            return None
+        idx = self._nth
+        if idx < 0:
+            idx += len(matches)
+        if 0 <= idx < len(matches):
+            return matches[idx]
+        return None
+
     def _find_matches(self, screenshot: Image.Image) -> list[ElementMatch]:
         """Run the actual search on a screenshot."""
         if self._text is not None:
-            return self._ocr.find_text(screenshot, self._text, exact=self._exact)
+            return self._get_ocr().find_text(screenshot, self._text, exact=self._exact)
         elif self._image is not None:
             return ImageMatcher.find_image(screenshot, self._image)
         elif self._image_obj is not None:
@@ -137,6 +170,8 @@ class Locator:
             return f'text="{self._text}"' + (" (exact)" if self._exact else "")
         elif self._image:
             return f'image="{self._image}"'
+        elif self._image_obj is not None:
+            return f"image_obj={self._image_obj.size}"
         return "unknown"
 
     # --- Actions (mirror Playwright's API) ---
@@ -230,11 +265,14 @@ class Locator:
                     screenshot = self._capture.screenshot(
                         region=self._region, monitor=self._monitor
                     )
-                    matches = self._find_matches(screenshot)
-                    if not matches or len(matches) <= self._nth:
+                    if self._select(self._find_matches(screenshot)) is None:
                         return None  # Element is gone
+                except self._FATAL_ERRORS:
+                    raise
                 except Exception:
-                    return None
+                    # A transient capture/OCR failure is not proof the element
+                    # disappeared, so keep polling instead of reporting success.
+                    logger.debug("Poll failed while waiting for hidden", exc_info=True)
 
                 if time.time() >= deadline:
                     raise TimeoutError(
@@ -243,12 +281,20 @@ class Locator:
                     )
                 time.sleep(self._poll_interval)
 
+        raise ValueError(f"Unknown state {state!r}. Expected 'visible' or 'hidden'.")
+
     def is_visible(self, timeout: float = 0) -> bool:
-        """Check if the element is currently visible (non-waiting)."""
+        """
+        Check if the element is currently visible.
+
+        Returns False if the element is not found within `timeout` (0 = check
+        once, no waiting). Genuine errors — such as a template image path that
+        does not exist — are raised rather than reported as "not visible".
+        """
         try:
             self._resolve(timeout=timeout)
             return True
-        except (TimeoutError, OSWrightError):
+        except TimeoutError:
             return False
 
     # --- Info ---
@@ -295,6 +341,7 @@ class Locator:
             exact=self._exact, timeout=self._timeout,
             poll_interval=self._poll_interval, region=self._region,
             monitor=self._monitor, nth=index,
+            ocr_provider=self._ocr_provider,
         )
         return new
 
@@ -318,48 +365,84 @@ class LocatorAssertions:
         screen.locator(text="Hello").expect().to_have_text("Hello World")
     """
 
-    def __init__(self, locator: Locator, timeout: float = 10.0):
+    def __init__(self, locator: Locator, timeout: Optional[float] = None):
         self._locator = locator
-        self._timeout = timeout
+        # Inherit the locator's configured timeout unless explicitly overridden,
+        # so `OSWright(timeout=30)` actually applies to assertions too.
+        self._timeout = timeout if timeout is not None else locator._timeout
+
+    def _resolve_timeout(self, timeout: Optional[float]) -> float:
+        """Use the explicit timeout when given, including an explicit 0."""
+        return self._timeout if timeout is None else timeout
 
     def to_be_visible(self, timeout: Optional[float] = None):
         """Assert the element is visible on screen."""
-        timeout = timeout or self._timeout
+        timeout = self._resolve_timeout(timeout)
         try:
             self._locator._resolve(timeout=timeout)
         except TimeoutError:
             raise AssertionError(
                 f"Expected {self._locator._describe()} to be visible, "
                 f"but it was not found within {timeout}s"
-            )
+            ) from None
 
     def not_to_be_visible(self, timeout: Optional[float] = None):
         """Assert the element is NOT visible on screen."""
-        timeout = timeout or self._timeout
+        timeout = self._resolve_timeout(timeout)
         try:
             self._locator.wait_for(state="hidden", timeout=timeout)
         except TimeoutError:
             raise AssertionError(
                 f"Expected {self._locator._describe()} to be hidden, "
                 f"but it was still visible after {timeout}s"
-            )
+            ) from None
+
+    def _poll_text(
+        self, timeout: float, predicate, description: str
+    ):
+        """
+        Poll until the element's text satisfies `predicate`, or time out.
+
+        Checking only once would fail an element whose text is still being
+        populated — exactly the flakiness auto-waiting is meant to remove.
+        """
+        deadline = time.time() + timeout
+        last_seen = None
+        while True:
+            remaining = max(0.0, deadline - time.time())
+            try:
+                match = self._locator._resolve(timeout=remaining)
+            except TimeoutError:
+                raise AssertionError(
+                    f"Expected {self._locator._describe()} {description}, "
+                    f"but it was not found within {timeout}s"
+                ) from None
+
+            last_seen = match.text
+            if predicate(match.text):
+                return match
+
+            if time.time() >= deadline:
+                raise AssertionError(
+                    f"Expected {self._locator._describe()} {description}, "
+                    f"but got '{last_seen}' after {timeout}s"
+                )
+            time.sleep(self._locator._poll_interval)
 
     def to_have_text(self, expected: str, timeout: Optional[float] = None):
         """Assert the element contains the expected text."""
-        timeout = timeout or self._timeout
-        match = self._locator._resolve(timeout=timeout)
-        if match.text is None or expected.lower() not in match.text.lower():
-            raise AssertionError(
-                f"Expected {self._locator._describe()} to have text '{expected}', "
-                f"but got '{match.text}'"
-            )
+        timeout = self._resolve_timeout(timeout)
+        self._poll_text(
+            timeout,
+            lambda t: t is not None and expected.lower() in t.lower(),
+            f"to have text '{expected}'",
+        )
 
     def to_have_exact_text(self, expected: str, timeout: Optional[float] = None):
         """Assert the element has exactly the expected text."""
-        timeout = timeout or self._timeout
-        match = self._locator._resolve(timeout=timeout)
-        if match.text != expected:
-            raise AssertionError(
-                f"Expected {self._locator._describe()} to have exact text '{expected}', "
-                f"but got '{match.text}'"
-            )
+        timeout = self._resolve_timeout(timeout)
+        self._poll_text(
+            timeout,
+            lambda t: t == expected,
+            f"to have exact text '{expected}'",
+        )

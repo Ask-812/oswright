@@ -1,215 +1,227 @@
-"""End-to-end tests for all oswright subsystems."""
-import sys
-import time
-import traceback
+"""
+End-to-end tests that exercise the real desktop.
+
+These are marked `e2e` and skip automatically when the machine has no display
+or no OCR backend, so `pytest` is safe to run anywhere:
+
+    pytest tests/                # everything available on this machine
+    pytest tests/ -m "not e2e"   # unit tests only
+"""
+
+import json
+import platform
+
+import pytest
+
+pytestmark = pytest.mark.e2e
+
+IS_WINDOWS = platform.system() == "Windows"
+windows_only = pytest.mark.skipif(not IS_WINDOWS, reason="Windows-only feature")
 
 
-def test_screenshot():
-    print("=== TEST 1: Screenshot ===")
-    from oswright.capture import ScreenCapture
-    cap = ScreenCapture()
-    img = cap.screenshot()
-    print(f"OK: Screenshot {img.size}")
-    cap.close()
-    return img
+class TestCapture:
+    def test_screenshot_has_size(self, screenshot):
+        w, h = screenshot.size
+        assert w > 0 and h > 0
+
+    def test_screen_size_matches_screenshot(self, capture, screenshot):
+        size = capture.get_screen_size(0)
+        assert (size["width"], size["height"]) == screenshot.size
+
+    def test_region_capture_is_cropped(self, capture):
+        img = capture.screenshot(region={"left": 0, "top": 0, "width": 40, "height": 30})
+        assert img.size == (40, 30)
+
+    def test_offset_matches_monitor_origin(self, capture):
+        size = capture.get_screen_size(0)
+        assert capture.get_offset(monitor=0) == (size["left"], size["top"])
+
+    def test_region_offset_is_region_origin(self, capture):
+        region = {"left": 17, "top": 23, "width": 10, "height": 10}
+        assert capture.get_offset(region=region) == (17, 23)
 
 
-def test_windows_ocr(img):
-    print("\n=== TEST 2: Windows OCR ===")
-    from oswright._ocr_windows import is_available, recognize
-    print(f"Available: {is_available()}")
-    if is_available():
-        results = recognize(img, "en")
-        print(f"OK: Found {len(results)} words")
-        for r in results[:3]:
-            print(f"  {r['text']} at ({r['left']},{r['top']})")
-    return is_available()
+class TestOCREngine:
+    def test_reads_some_text(self, ocr, screenshot):
+        elements = ocr.read_all(screenshot)
+        assert isinstance(elements, list)
+        for el in elements[:20]:
+            assert el.text is not None
+            assert el.width >= 0 and el.height >= 0
+
+    def test_coordinates_are_plain_ints(self, ocr, screenshot):
+        for el in ocr.read_all(screenshot)[:20]:
+            assert type(el.x) is int
+            assert type(el.y) is int
+            # Must survive JSON encoding to reach an MCP client.
+            json.dumps({"x": el.x, "y": el.y, "conf": el.confidence})
+
+    def test_find_text_returns_subset(self, ocr, screenshot):
+        all_elements = ocr.read_all(screenshot)
+        if not all_elements:
+            pytest.skip("No text detected on screen")
+        target = next((e.text for e in all_elements if e.text and len(e.text) > 3), None)
+        if target is None:
+            pytest.skip("No usable text detected on screen")
+
+        matches = ocr.find_text(screenshot, target)
+        assert matches
+        assert all(target.lower() in m.text.lower() for m in matches)
+
+    def test_cache_returns_equal_results(self, ocr, screenshot):
+        ocr._cache.invalidate()
+        first = ocr.read_all(screenshot)
+        second = ocr.read_all(screenshot)
+        assert len(first) == len(second)
+        assert ocr._cache.stats["hits"] >= 1
+
+    def test_cache_does_not_leak_mutations(self, ocr, screenshot):
+        """A caller mutating returned results must not corrupt the cache."""
+        ocr._cache.invalidate()
+        first = ocr.read_all(screenshot)
+        if not first:
+            pytest.skip("No text detected on screen")
+        count = len(first)
+        first.append("junk")
+        assert len(ocr.read_all(screenshot)) == count
 
 
-def test_ocr_engine(img):
-    print("\n=== TEST 3: OCR Engine (auto backend) ===")
-    from oswright.detect import OCREngine
-    ocr = OCREngine()
-    print(f"Backend: {ocr.backend_name}")
-    elements = ocr.read_all(img)
-    print(f"OK: Found {len(elements)} text elements")
-    for el in elements[:3]:
-        print(f'  "{el.text}" conf={el.confidence:.2f} at ({el.x},{el.y})')
-    return ocr, elements
+@windows_only
+class TestWindows:
+    def test_lists_windows_with_valid_handles(self):
+        from oswright.window import list_windows
+
+        windows = list_windows()
+        assert windows
+        assert all(w.handle > 0 for w in windows)
+        assert all(w.process_id for w in windows), "PID lookup failed"
+        assert all(w.process_name for w in windows), "process name lookup failed"
+
+    def test_at_most_one_foreground_window(self):
+        from oswright.window import list_windows
+
+        assert sum(1 for w in list_windows() if w.is_foreground) <= 1
+
+    def test_window_region_within_virtual_screen(self):
+        from oswright.window import _virtual_screen, get_window_region, list_windows
+
+        vl, vt, vr, vb = _virtual_screen()
+        for w in list_windows()[:5]:
+            region = get_window_region(handle=w.handle)
+            if region is None:
+                continue
+            assert region["width"] > 0 and region["height"] > 0
+            assert region["left"] >= vl and region["top"] >= vt
+            assert region["left"] + region["width"] <= vr
+            assert region["top"] + region["height"] <= vb
+
+    def test_dpi_coordinates_agree_with_capture(self, capture):
+        """Window metrics and screenshot pixels must use the same scale."""
+        from oswright.window import _virtual_screen
+
+        vl, vt, vr, vb = _virtual_screen()
+        size = capture.get_screen_size(0)
+        assert (vr - vl, vb - vt) == (size["width"], size["height"])
 
 
-def test_find_text(ocr, img):
-    print("\n=== TEST 4: Find specific text ===")
-    for term in ["Start", "Search", "File", "Edit", "View", "Type", "Help"]:
-        matches = ocr.find_text(img, term)
-        if matches:
-            m = matches[0]
-            print(f'OK: Found "{term}" ({len(matches)} matches, best conf={m.confidence:.2f} at ({m.x},{m.y}))')
-            return True
-    print("WARN: Could not find common UI text on screen")
-    return False
+@windows_only
+class TestAccessibility:
+    def test_tree_elements_are_addressable(self):
+        from oswright.accessibility import get_focused_window_tree, is_available
+
+        if not is_available():
+            pytest.skip("uiautomation not installed")
+
+        for el in get_focused_window_tree(max_depth=3):
+            assert el.name or el.automation_id
+            assert el.width > 0 and el.height > 0
 
 
-def test_window_management():
-    print("\n=== TEST 5: Window management ===")
-    from oswright.window import list_windows, get_window_region
-    wins = list_windows()
-    print(f"OK: {len(wins)} windows")
-    for w in wins[:3]:
-        print(f"  [{w.process_name}] {w.title[:50]}")
-    if wins:
-        region = get_window_region(title=wins[0].title[:20])
-        print(f"Region for first window: {region}")
+class TestMCPTools:
+    """The MCP tool surface, called directly as plain functions."""
 
+    def test_get_screen_info(self, capture):
+        from oswright.mcp_server import get_screen_info
 
-def test_clipboard():
-    print("\n=== TEST 6: Clipboard ===")
-    from oswright.clipboard import get_text, set_text
-    test_str = "oswright_e2e_test_" + str(int(time.time()))
-    ok = set_text(test_str)
-    got = get_text()
-    passed = got == test_str
-    print(f"OK: set={ok}, match={passed}")
-    if not passed:
-        print(f"  Expected: {test_str!r}")
-        print(f"  Got: {got!r}")
+        info = json.loads(get_screen_info())
+        assert info["screen_size"]["width"] > 0
+        assert info["monitor_count"] >= 1
 
+    def test_screenshot_reports_origin(self, capture):
+        from oswright.mcp_server import screenshot as screenshot_tool
 
-def test_accessibility():
-    print("\n=== TEST 7: Accessibility ===")
-    from oswright.accessibility import is_available, get_focused_window_tree
-    print(f"UIA available: {is_available()}")
-    if is_available():
-        elements = get_focused_window_tree(max_depth=3)
-        print(f"OK: {len(elements)} UI elements in focused window")
-        for el in elements[:5]:
-            print(f'  [{el.control_type}] "{el.name[:40]}"')
+        result = screenshot_tool()
+        meta = json.loads(result[0])
+        assert meta["width"] > 0
+        assert "origin_x" in meta and "origin_y" in meta
 
+    def test_screenshot_rejects_partial_region(self, capture):
+        from oswright.mcp_server import screenshot as screenshot_tool
 
-def test_cache_performance(ocr, img):
-    print("\n=== TEST 8: Cache performance ===")
-    # First call (may or may not be cached from earlier)
-    ocr._cache.invalidate()
+        meta = json.loads(screenshot_tool(region_left=0, region_top=0)[0])
+        assert "error" in meta
 
-    t1 = time.perf_counter()
-    r1 = ocr.read_all(img)
-    t2 = time.perf_counter()
-    r2 = ocr.read_all(img)  # should be cached
-    t3 = time.perf_counter()
+    def test_screenshot_refuses_to_overwrite(self, capture, tmp_path):
+        from oswright.mcp_server import screenshot as screenshot_tool
 
-    first = (t2 - t1) * 1000
-    cached = (t3 - t2) * 1000
-    speedup = first / max(cached, 0.001)
-    print(f"First scan: {first:.0f}ms, Cached: {cached:.1f}ms")
-    print(f"Cache speedup: {speedup:.0f}x")
-    print(f"Cache stats: {ocr._cache.stats}")
-    print(f"Results consistent: {len(r1) == len(r2)}")
+        existing = tmp_path / "taken.png"
+        existing.write_bytes(b"do not clobber me")
 
+        meta = json.loads(screenshot_tool(save_path=str(existing))[0])
+        assert "error" in meta
+        assert existing.read_bytes() == b"do not clobber me"
 
-def test_mcp_tools():
-    print("\n=== TEST 9: MCP server tools ===")
-    from oswright.mcp_server import (
-        screenshot, get_screen_info, find_text_on_screen,
-        read_screen_text, mouse_click, type_text, press_key,
-        click_text, get_clipboard, set_clipboard,
-        list_windows, get_active_window, get_ocr_info,
-        get_mouse_position, launch_app, wait_for_change,
-    )
-    import json
+    def test_read_screen_text_is_json(self, capture, ocr):
+        from oswright.mcp_server import read_screen_text
 
-    # Test get_screen_info
-    info = json.loads(get_screen_info())
-    print(f"Screen: {info['screen_size']['width']}x{info['screen_size']['height']}, {info['monitor_count']} monitors")
+        data = json.loads(read_screen_text())
+        assert data["element_count"] == len(data["elements"])
 
-    # Test get_mouse_position
-    pos = json.loads(get_mouse_position())
-    print(f"Mouse: ({pos['x']}, {pos['y']})")
+    def test_find_image_reports_missing_template(self, capture):
+        from oswright.mcp_server import find_image_on_screen
 
-    # Test screenshot (returns list with JSON + image)
-    result = screenshot()
-    meta = json.loads(result[0])
-    print(f"Screenshot tool: {meta['width']}x{meta['height']}")
+        data = json.loads(find_image_on_screen(template_path="definitely_not_here.png"))
+        assert "error" in data
 
-    # Test get_ocr_info
-    ocr_info = json.loads(get_ocr_info())
-    print(f"OCR: backend={ocr_info['active_backend']}, available={ocr_info['available_backends']}")
+    def test_mouse_click_rejects_half_coordinates(self):
+        from oswright.mcp_server import mouse_click
 
-    # Test get_active_window
-    win = json.loads(get_active_window())
-    print(f"Active window: {win.get('title', 'unknown')[:50]}")
+        assert "error" in json.loads(mouse_click(x=100)[0])
 
-    # Test clipboard tools
-    set_clipboard("mcp_tool_test")
-    clip = json.loads(get_clipboard())
-    print(f"Clipboard tool: {clip['clipboard_text'] == 'mcp_tool_test'}")
+    def test_get_ocr_info(self, ocr):
+        from oswright.mcp_server import get_ocr_info
 
-    # Test list_windows
-    wins = json.loads(list_windows())
-    print(f"List windows tool: {wins['window_count']} windows")
+        info = json.loads(get_ocr_info())
+        assert info["active_backend"] in info["available_backends"]
 
-    # Test read_screen_text
-    text = json.loads(read_screen_text())
-    print(f"Read screen text: {text['element_count']} elements")
+    def test_get_mouse_position(self):
+        from oswright.mcp_server import get_mouse_position
 
-    print("All MCP tools OK")
+        pos = json.loads(get_mouse_position())
+        assert isinstance(pos["x"], int) and isinstance(pos["y"], int)
 
+    @windows_only
+    def test_list_windows_tool(self):
+        from oswright.mcp_server import list_windows
 
-def main():
-    passed = 0
-    failed = 0
-    tests = [
-        ("Screenshot", lambda: test_screenshot()),
-    ]
+        data = json.loads(list_windows())
+        assert data["window_count"] == len(data["windows"])
 
-    try:
-        img = test_screenshot()
-        passed += 1
-    except Exception as e:
-        print(f"FAIL: {e}")
-        traceback.print_exc()
-        failed += 1
-        return
+    @windows_only
+    def test_active_window_tool(self):
+        from oswright.mcp_server import get_active_window
 
-    ocr = None
-    for name, fn, args in [
-        ("Windows OCR", test_windows_ocr, (img,)),
-        ("OCR Engine", test_ocr_engine, (img,)),
-    ]:
-        try:
-            result = fn(*args)
-            passed += 1
-            if name == "OCR Engine":
-                ocr, elements = result
-        except Exception as e:
-            print(f"FAIL [{name}]: {e}")
-            traceback.print_exc()
-            failed += 1
+        assert "title" in json.loads(get_active_window())
 
-    if ocr is None:
-        print("\nSKIPPING remaining tests (OCR engine failed)")
-        print(f"\nRESULTS: {passed} passed, {failed} failed")
-        return
+    @windows_only
+    def test_clipboard_roundtrip_tool(self):
+        from oswright.mcp_server import get_clipboard, set_clipboard
 
-    for name, fn, args in [
-        ("Find Text", test_find_text, (ocr, img)),
-        ("Window Mgmt", test_window_management, ()),
-        ("Clipboard", test_clipboard, ()),
-        ("Accessibility", test_accessibility, ()),
-        ("Cache Perf", test_cache_performance, (ocr, img)),
-        ("MCP Tools", test_mcp_tools, ()),
-    ]:
-        try:
-            fn(*args)
-            passed += 1
-        except Exception as e:
-            print(f"FAIL [{name}]: {e}")
-            traceback.print_exc()
-            failed += 1
+        marker = "oswright_e2e_clipboard"
+        assert json.loads(set_clipboard(marker))["success"]
+        assert json.loads(get_clipboard())["clipboard_text"] == marker
 
-    print(f"\n{'='*50}")
-    print(f"RESULTS: {passed} passed, {failed} failed")
-    print(f"{'='*50}")
+    def test_launch_app_rejects_empty_command(self):
+        from oswright.mcp_server import launch_app
 
-
-if __name__ == "__main__":
-    main()
+        assert "error" in json.loads(launch_app(command="   ")[0])

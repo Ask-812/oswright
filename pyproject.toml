@@ -4,13 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "oswright"
-version = "0.3.1"
+# Single source of truth is oswright/__init__.py, read statically by setuptools.
+dynamic = ["version"]
 description = "Playwright-like automation framework for the operating system"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 authors = [{name = "OSWright Contributors"}]
-keywords = ["automation", "testing", "os", "desktop", "gui"]
+keywords = ["automation", "testing", "os", "desktop", "gui", "mcp", "ocr", "rpa"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -31,22 +32,86 @@ dependencies = [
     "Pillow>=10.0",
     "opencv-python>=4.8",
     "numpy>=1.24",
-    "easyocr>=1.7",
-    "mcp[cli]>=1.0",
+    # Upper bound is required: mcp 2.x removed mcp.server.fastmcp, which every
+    # tool in mcp_server.py is built on. Without the bound, a fresh install
+    # picks up 2.x and the server fails to import at all.
+    "mcp[cli]>=1.0,<2",
+
+    # Windows: built-in OCR + UI Automation. Fast, tiny, no model download.
+    "winrt-runtime>=2.2; sys_platform == 'win32'",
+    "winrt-Windows.Media.Ocr>=2.2; sys_platform == 'win32'",
+    "winrt-Windows.Globalization>=2.2; sys_platform == 'win32'",
+    "winrt-Windows.Graphics.Imaging>=2.2; sys_platform == 'win32'",
+    # These four are required at runtime but never imported directly:
+    #   Foundation             -> IAsyncOperation returned by recognize_async
+    #   Foundation.Collections -> the IVectorView of lines/words in the result
+    #   Storage.Streams        -> the IBuffer used by copy_from_buffer
+    # A clean install without them fails at the first OCR call, not at import,
+    # so they are easy to miss when developing in an environment that has them.
+    "winrt-Windows.Foundation>=2.2; sys_platform == 'win32'",
+    "winrt-Windows.Foundation.Collections>=2.2; sys_platform == 'win32'",
+    "winrt-Windows.Storage.Streams>=2.2; sys_platform == 'win32'",
+    "uiautomation>=2.0; sys_platform == 'win32'",
+
+    # Linux/macOS: EasyOCR is the only OCR backend, so it ships by default there.
+    # It pulls in torch (~2.5 GB), which is why it is NOT installed on Windows.
+    "easyocr>=1.7; sys_platform != 'win32'",
     "pynput>=1.7; sys_platform != 'win32'",
 ]
 
 [project.optional-dependencies]
-winocr = [
-    "winocr>=0.0.15; sys_platform == 'win32'",
+# Opt-in EasyOCR on Windows (fallback for languages Windows OCR lacks).
+# Warning: pulls in torch, ~2.5 GB.
+easyocr = ["easyocr>=1.7"]
+
+# Deprecated aliases kept so existing `oswright[winocr]` / `oswright[uia]`
+# installs keep working. The underlying packages are now installed by default
+# on Windows, so these are no-ops.
+winocr = []
+uia = []
+
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.1",
 ]
-uia = [
-    "uiautomation>=2.0; sys_platform == 'win32'",
-]
-dev = ["pytest>=7.0", "ruff>=0.1"]
+
+[project.urls]
+Homepage = "https://github.com/Ask-812/oswright"
+Repository = "https://github.com/Ask-812/oswright"
+Issues = "https://github.com/Ask-812/oswright/issues"
 
 [project.scripts]
 oswright = "oswright.mcp_server:main"
 
 [tool.setuptools.packages.find]
 include = ["oswright*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "oswright.__version__"}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "e2e: end-to-end tests that drive the real desktop (auto-skipped when no display is available)",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = [
+    "E501",   # line length is handled by the formatter, not enforced
+    "B008",   # function call in default argument — not used here
+    # `Optional[X]` is used consistently throughout and is what the MCP schema
+    # generation has been validated against. Rewriting to `X | None` would be
+    # pure churn across ~200 signatures.
+    "UP007",
+    "UP045",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Backends deliberately re-export names and import lazily.
+"oswright/input.py" = ["F401"]
+"oswright/detect.py" = ["E402"]
