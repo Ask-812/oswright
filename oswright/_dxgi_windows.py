@@ -27,6 +27,7 @@ import ctypes
 import ctypes.wintypes
 import logging
 import platform
+import threading
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -356,6 +357,12 @@ class DxgiDirtySource:
 
     Not thread-safe: a duplication object belongs to the thread that created it.
     Create one per thread, or guard access.
+
+    Windows allows exactly one Desktop Duplication per output per process, so
+    do not construct these directly from more than one place -- use
+    :func:`acquire_shared` and :func:`release_shared`. A second instance built
+    while another is alive fails with E_INVALIDARG and degrades to hashing,
+    which is silent and easy to miss.
     """
 
     # A frame can report a great many small rectangles. Past this point the
@@ -365,6 +372,7 @@ class DxgiDirtySource:
 
     def __init__(self, output_index: int = 0):
         self._output_index = output_index
+        self._shared_key = None
         self._dup = None
         self._device = None
         self._d3d_device = None
@@ -619,3 +627,64 @@ class DxgiDirtySource:
 
         returned = min(count, required.value // ctypes.sizeof(RECT))
         return [buffer[i] for i in range(returned)]
+
+
+# ---------------------------------------------------------------------------
+# Shared ownership
+# ---------------------------------------------------------------------------
+#
+# Windows grants one Desktop Duplication per output per process. Two components
+# here want change notifications -- settle detection and the screen model -- and
+# when each built its own, the second failed with E_INVALIDARG and quietly fell
+# back to hashing. Every component measured fine alone, so no isolated benchmark
+# could see it. The resource is per-process, so it is owned per-process.
+#
+# Keyed by thread as well as output because a duplication belongs to the thread
+# that created it; a second thread gets its own attempt rather than borrowing an
+# object it cannot safely use.
+
+_shared_lock = threading.Lock()
+_shared_sources: dict = {}
+_shared_refs: dict = {}
+
+
+def acquire_shared(output_index: int = 0) -> "DxgiDirtySource":
+    """
+    Borrow the process-wide duplication source for this thread and output.
+
+    Always returns a source. If duplication is unusable the source reports that
+    through ``failure_reason`` and callers fall back, exactly as before.
+    """
+    key = (threading.get_ident(), output_index)
+    with _shared_lock:
+        source = _shared_sources.get(key)
+        if source is None:
+            source = DxgiDirtySource(output_index)
+            source._shared_key = key
+            _shared_sources[key] = source
+        _shared_refs[key] = _shared_refs.get(key, 0) + 1
+    return source
+
+
+def release_shared(source: "DxgiDirtySource") -> None:
+    """Give back a source from :func:`acquire_shared`; close it on the last release."""
+    if source is None:
+        return
+    key = getattr(source, "_shared_key", None)
+    if key is None:
+        source.close()
+        return
+    with _shared_lock:
+        remaining = _shared_refs.get(key, 0) - 1
+        if remaining > 0:
+            _shared_refs[key] = remaining
+            return
+        _shared_refs.pop(key, None)
+        _shared_sources.pop(key, None)
+    source.close()
+
+
+def shared_refcount(output_index: int = 0) -> int:
+    """How many holders the current thread's shared source has. For tests."""
+    with _shared_lock:
+        return _shared_refs.get((threading.get_ident(), output_index), 0)

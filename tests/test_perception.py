@@ -5,6 +5,8 @@ These use synthetic images and a stub OCR engine, so they run without a display
 or an OCR backend and are safe in CI.
 """
 
+import platform
+
 import pytest
 from PIL import Image, ImageDraw
 
@@ -631,3 +633,58 @@ class TestCascadeOrder:
         )
         assert not result.found
         assert result.rungs_tried == ["model", "incremental"]
+
+
+# ---------------------------------------------------------------------------
+# Shared compositor ownership
+# ---------------------------------------------------------------------------
+#
+# Windows grants one Desktop Duplication per output per process. Two trackers
+# exist in the server (settle detection and the screen model), and when each
+# built its own, the second failed with E_INVALIDARG and silently degraded to
+# hashing. Each component benchmarked fine alone, which is exactly why this
+# needs a test rather than a benchmark.
+
+
+@pytest.mark.skipif(platform.system() != "Windows", reason="Windows only")
+def test_trackers_share_one_duplication():
+    from oswright._dxgi_windows import is_available, shared_refcount
+
+    if not is_available():
+        pytest.skip("Desktop Duplication unavailable")
+
+    before = shared_refcount()
+    first, second = DirtyTracker(), DirtyTracker()
+    try:
+        source = first._get_compositor()
+        if source is None or source.failure_reason is not None:
+            pytest.skip("compositor not usable in this session")
+
+        assert second._get_compositor() is source, "each tracker built its own"
+        assert second.compositor_active, "second tracker degraded to hashing"
+        assert shared_refcount() == before + 2
+    finally:
+        first.close()
+        second.close()
+
+    assert shared_refcount() == before, "closing did not release the duplication"
+
+
+@pytest.mark.skipif(platform.system() != "Windows", reason="Windows only")
+def test_tracker_can_reacquire_after_close():
+    """A closed tracker must be able to borrow again, not stay dead."""
+    from oswright._dxgi_windows import is_available
+
+    if not is_available():
+        pytest.skip("Desktop Duplication unavailable")
+
+    tracker = DirtyTracker()
+    was_active = tracker.compositor_active
+    tracker.close()
+    if not was_active:
+        pytest.skip("compositor not usable in this session")
+
+    try:
+        assert tracker.compositor_active, "tracker stayed dead after close()"
+    finally:
+        tracker.close()
