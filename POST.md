@@ -65,6 +65,45 @@ Works with Claude Desktop, VS Code, Cursor, Windsurf, Cline, Goose, and any MCP 
 
 ## Version History
 
+### v0.5.1 — Compositor-driven change detection
+
+The Windows compositor already knows which pixels changed — it has to, in order
+to present efficiently — and exposes it through DXGI Desktop Duplication.
+Computing the same thing by hashing a captured frame is redundant work.
+
+More importantly, `AcquireNextFrame` answers "did anything change?" **without
+transferring any pixels**: 0.14 ms, against ~48 ms to capture a frame and then
+discover it was identical. Most observations during an agent session are of an
+idle screen, so the capture is skipped entirely.
+
+| | v0.4.0 | v0.5.0 | v0.5.1 |
+|---|---|---|---|
+| Median latency per step | 212 ms | 71 ms | **33 ms** |
+| Idle observation | ~212 ms | ~60 ms | **~0.6 ms** |
+
+Measured live, 8 of 15 observations were skipped without capturing anything.
+
+Implementing this meant hand-writing the DXGI COM interfaces via `comtypes`,
+since no Python binding exposes dirty rectangles. Two failures worth recording:
+`D3D11CreateDevice` without declared `argtypes` truncates pointers on 64-bit and
+faults rather than returning an error; and `comtypes` raises `COMError`, which is
+not an `OSError`, so `DXGI_ERROR_WAIT_TIMEOUT` — the *normal* signal meaning
+"nothing changed", arriving on every idle poll — was being treated as fatal.
+
+**Deliberate limitation.** The compositor is used only as a fast *negative*.
+When it reports a change, regions still come from hashing the captured frame,
+because the two are measured over slightly different intervals and compositor
+rectangles can under-report relative to the pixels actually captured. An
+under-reported region is text that never gets re-read, which is the exact
+failure this design exists to prevent. Roughly 7 ms of hashing buys that
+guarantee.
+
+Also added: `benchmarks/` so every performance claim is reproducible, and
+`docs/ENGINEERING_LOG.md` recording the reasoning, the measurements, and the
+dead ends — including the discovery that capturing only dirty regions is *2×
+slower* than one full-screen grab, because `mss` has a fixed ~16.6 ms per-grab
+cost regardless of region size.
+
 ### v0.5.0 — Incremental perception
 
 The expensive thing about a GUI agent is not clicking, it is looking. Every

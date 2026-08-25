@@ -151,9 +151,11 @@ class ScreenModel:
         self._monitor = monitor
         self._tracker = DirtyTracker()
         self._elements: list[Element] = []
+        self._last_total_pixels = 0
         self.stats = {
             "observations": 0,
             "full_rescans": 0,
+            "compositor_skips": 0,
             "regions_scanned": 0,
             "pixels_scanned": 0,
             "pixels_total": 0,
@@ -183,11 +185,25 @@ class ScreenModel:
             image: Use this frame instead of capturing one (for testing).
         """
         started = time.perf_counter()
+
+        # Ask the compositor before capturing anything. On an idle screen this
+        # settles the question for a fraction of a millisecond, against ~33 ms
+        # to capture a frame and then discover it was identical.
+        if image is None and not force_full and self._tracker.nothing_changed():
+            self.stats["observations"] += 1
+            self.stats["compositor_skips"] += 1
+            return Delta(
+                regions=[],
+                total_pixels=self._last_total_pixels,
+                duration_ms=(time.perf_counter() - started) * 1000,
+            )
+
         if image is None:
             image = self._capture.screenshot(monitor=self._monitor)
 
         width, height = image.size
         total_pixels = width * height
+        self._last_total_pixels = total_pixels
 
         if force_full:
             self._tracker.reset()
@@ -318,9 +334,15 @@ class ScreenModel:
         return {
             "observations": self.stats["observations"],
             "full_rescans": self.stats["full_rescans"],
+            "compositor_skips": self.stats["compositor_skips"],
+            "compositor_active": self._tracker.compositor_active,
             "pixels_scanned": scanned,
             "pixels_total": total,
             "fraction_scanned": round(scanned / total, 4) if total else 0.0,
             "work_avoided": f"{(1 - scanned / total) * 100:.1f}%" if total else "0%",
             "elements_tracked": len(self._elements),
         }
+
+    def close(self):
+        """Release resources held by the model."""
+        self._tracker.close()
