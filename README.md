@@ -654,6 +654,14 @@ about 32 pixels, while genuine UI changes cover tens of thousands.
 - **Transitions keyed on more than the previous screen**, for actions whose
   outcome depends on state that is not visible.
 
+### What is measured, and what is not
+
+Every number here is perception **cost**, reproducible via `benchmarks/`. Task
+**success** — whether an agent actually completes work — has a harness
+(`benchmarks/bench_tasks.py`) but no completed sweep, and no head-to-head
+against other GUI agents. Cheaper perception is established; *better outcomes*
+is not, and the difference matters.
+
 ## Development
 
 ```bash
@@ -663,6 +671,7 @@ pytest tests/                # everything available on this machine
 pytest tests/ -m "not e2e"   # unit tests only, no desktop needed
 ruff check oswright tests    # lint
 python benchmarks/bench_pipeline.py   # reproduce the performance numbers
+python benchmarks/bench_tasks.py      # task success (opens Calculator repeatedly)
 ```
 
 Design decisions, measurements and dead ends are recorded in

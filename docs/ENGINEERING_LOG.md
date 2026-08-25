@@ -549,10 +549,66 @@ miss.
 
 ---
 
+### 2.12 The metric everything else was a proxy for
+
+Every measurement up to this point was perception *cost*. Cost is a proxy. The
+metric that matters for a GUI agent is whether it finishes the job — and a
+cheaper perception path that quietly degraded accuracy would be worse than no
+optimisation at all.
+
+That was an unexamined assumption for eight versions. `benchmarks/bench_tasks.py`
+exists to examine it: scripted tasks driven through the real MCP tool surface,
+across four configurations from v0.4-style full-screenshot perception to memory
+plus prediction, verified against **Calculator's own state via UI Automation**.
+Grading OCR with OCR would only establish that it agrees with itself.
+
+**Status: written and structurally validated, full sweep not yet run** — it
+takes about six minutes of Calculator windows stealing focus, and the machine
+was in use. Partial runs during development showed no accuracy difference
+between configurations with token cost falling by roughly an order of magnitude,
+but a partial run is not a measurement and is not quoted as one.
+
+Building it produced three findings that are worth more than the sweep.
+
+**Windows OCR cannot see isolated digits.** Pointed at Calculator it returned 30
+text elements — `DEG`, `MC`, `Function`, `Trigonometry`, `log` — and **not one
+digit**. Not misread: absent. Text recognisers are trained on words and lines,
+and a lone glyph on a button has no line context to belong to. The cascade now
+routes queries of one or two characters to the accessibility tree first, because
+for those the pixel rungs are not a cheaper path to the same answer, they are a
+guaranteed miss followed by the accessibility rung anyway.
+
+**The label a human reads is not the label a machine exposes.** The button a
+person sees as "7" is named `Seven`. An agent reasoning from a screenshot asks
+for the wrong string, and no perception work fixes it — that needs a synonym
+layer, or an agent told to use accessible names. It is a whole class of failure
+that sits outside the problem I had been optimising.
+
+**Benchmarks need repeats before they are evidence.** The first version ran each
+task once, and reported flapping results: a configuration would "fail" on one
+run and pass on the next, because a XAML button occasionally does not process an
+invoke before the next one lands. A single sample cannot distinguish "this
+configuration is worse" from "that click did not register". Three repeats and a
+settle delay turned a noise generator into a measurement.
+
+**A safety decision worth recording.** Notepad was the obvious second subject,
+until launching it restored a document with unsaved changes belonging to the
+machine's owner. A benchmark has no business anywhere near that, so the subject
+list is Calculator alone — stateless, so opening and closing it cannot lose
+anyone's work.
+
+**And a self-inflicted wound.** A patch script opened the harness with
+`open(path, "w")`, which truncates immediately, then raised before writing. The
+file was left at zero bytes. `atlas.save()` writes to a temporary file and
+renames it precisely so an interrupted save cannot do this; the throwaway script
+did not, because it was throwaway. Small tools deserve the same care as the code
+they edit.
+
+---
+
 ## Part 3 — Results
 
 Measured over a 14-step agent loop at 1920×1080:
-
 | | v0.4.0 | v0.5.0 |
 |---|---|---|
 | Median latency per step | 212 ms | **33 ms** (6.5×) |
@@ -613,6 +669,15 @@ Worth knowing, because these are the questions an interviewer will ask.
     signal is inverted at every grid tried (§2.11). The right move was to state
     the guarantee accurately instead.
 
+14. **Optimised a proxy metric for eight versions without checking it.** All the
+    perception work targeted cost; the metric that matters is task success
+    (§2.12). The harness that checks it was the last thing built, not the first.
+15. **Wrote a benchmark with no repeats.** It flapped, reporting a dropped click
+    as a configuration difference (§2.12). One sample is not a measurement.
+16. **Truncated a file with `open(path, "w")` in a throwaway patch script** that
+    then raised, leaving it empty (§2.12). The production code writes to a
+    temporary file and renames precisely to prevent this.
+
 Approaches investigated and rejected on evidence:
 
 - **Hooking DirectWrite/GDI to recover text from the render path.** This is
@@ -662,6 +727,13 @@ Approaches investigated and rejected on evidence:
 - *How do you know a cached screen is still valid?* — §2.9. Pixels, not text,
   and it fails closed. Bring the table showing why mean difference was the wrong
   metric.
+- *Is this better than Windows-MCP or the other GUI agents?* — Not as a
+  product: they have OAuth, analytics, virtual-desktop management, a watchdog,
+  a vendored UIA library and actual users. Perception is where this wins, and
+  it is measured (§2.2, §2.11). Task success across the two has not been
+  compared, and saying otherwise would be a claim without evidence (§2.12).
+- *What would settle that?* — Running `bench_tasks.py` against both, on the
+  same tasks. The harness exists; the comparison does not.
 - *What does a confirmed prediction actually guarantee?* — §2.11. The layout,
   not every character. Bring the table showing the signal is inverted, and the
   test that pins the limitation rather than hiding it.

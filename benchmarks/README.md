@@ -11,7 +11,11 @@ python benchmarks/bench_pipeline.py   # v0.4.0 path vs v0.5.0 path, end to end
 python benchmarks/bench_atlas.py      # cost of a return visit to a known screen
 python benchmarks/bench_settle.py     # how long screens really take to respond
 python benchmarks/bench_speculate.py  # predicting an action instead of observing it
+python benchmarks/bench_tasks.py      # does any of it help complete tasks?
 ```
+
+`bench_tasks.py` opens and closes Calculator repeatedly (~6 minutes) and takes
+focus each time, so run it when the machine is free.
 
 Reference machine: HP EliteBook 840 G8, Intel Iris Xe, 16 GB RAM, 1920×1080 at
 125% scaling, Windows 11, Python 3.13. The *ratios* transfer; the absolute
@@ -92,3 +96,33 @@ layout makes the agent click somewhere arbitrary, so verification must fail
 closed — note that the inverted screen is *recognised* by the layout signature
 (inverting does not move edges) and then *rejected* by the pixel check. That
 split is the design: the signature filters, verification guarantees.
+
+## `bench_tasks.py` — does any of it help?
+
+Every other benchmark here measures perception *cost*, which is a proxy. This
+one measures whether the agent finishes the job, across four configurations
+from v0.4-style full-screenshot perception to memory plus prediction.
+
+Tasks drive the real MCP tool surface and are verified against **Calculator's
+own state via UI Automation** — grading OCR with OCR would only prove it agrees
+with itself. Each task runs three times per configuration, because a single
+sample cannot distinguish "this configuration is worse" from "that click did
+not register".
+
+**Status: written and structurally validated, full sweep not yet run.** Partial
+runs during development showed no accuracy difference between configurations,
+with token cost falling by roughly an order of magnitude — but that is not the
+same as a completed measurement and should not be quoted as one.
+
+Two findings did come out of building it, and both are real:
+
+- **Windows OCR cannot see isolated digits.** It returned 30 text elements from
+  the Calculator window — `DEG`, `MC`, `Function`, `Trigonometry`, `log` — and
+  **not one digit**. Text recognisers are trained on words and lines; a lone
+  glyph on a button has no line context to belong to. This is why the cascade
+  routes very short queries to the accessibility tree first.
+- **The label a human reads is not the label a machine exposes.** The button a
+  person sees as "7" is named `Seven` in the accessibility tree. An agent
+  reasoning from a screenshot asks for the wrong string, and no amount of
+  perception engineering fixes that — it needs a synonym layer or an agent told
+  to use accessible names.
