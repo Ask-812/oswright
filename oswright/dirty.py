@@ -182,20 +182,90 @@ class DirtyTracker:
     """
     Tracks which parts of the screen changed between successive frames.
 
+    Where the Windows compositor can answer, it is consulted first: asking
+    "did anything change?" via Desktop Duplication costs well under a
+    millisecond and transfers no pixels, whereas capturing a frame to hash costs
+    around 33 ms. Most observations during an agent session are of an idle
+    screen, so this skips the capture entirely rather than performing it and
+    then discovering there was nothing to do.
+
+    The compositor is used *only* as a fast negative. When it reports that
+    something did change, the regions still come from hashing the captured
+    frame, because the two are measured over slightly different intervals: the
+    capture happens after the poll, so compositor rectangles can under-report
+    relative to the pixels actually captured. Under-reporting would mean a
+    changed region never gets re-read, which is exactly the silent text loss
+    this design is meant to prevent. Hashing is measured against the very frame
+    being analysed, so it cannot disagree with it.
+
     The first frame is always reported as fully dirty, since there is no prior
     state to compare against.
     """
 
-    def __init__(self, tile: int = TILE, stride: int = 4):
+    def __init__(self, tile: int = TILE, stride: int = 4, use_compositor: bool = True):
         self._tile = tile
         self._stride = stride
         self._signature: Optional[np.ndarray] = None
         self._size: Optional[tuple[int, int]] = None
+        self._use_compositor = use_compositor
+        self._compositor = None
+        self._compositor_tried = False
+        self.compositor_skips = 0
+
+    def _get_compositor(self):
+        """Lazily create the compositor change source, once."""
+        if not self._use_compositor or self._compositor_tried:
+            return self._compositor
+        self._compositor_tried = True
+        try:
+            from oswright._dxgi_windows import DxgiDirtySource, is_available
+
+            if is_available():
+                self._compositor = DxgiDirtySource()
+        except Exception:  # pragma: no cover - platform dependent
+            logger.debug("Compositor change source unavailable", exc_info=True)
+        return self._compositor
+
+    @property
+    def compositor_active(self) -> bool:
+        """True if the compositor is answering change queries."""
+        source = self._get_compositor()
+        return source is not None and source.failure_reason is None
+
+    def nothing_changed(self) -> bool:
+        """
+        Cheap, authoritative check for "the screen is untouched".
+
+        Returns True only when the compositor positively confirms it. A False
+        result means either something changed or we could not tell, so callers
+        must fall back to capturing and hashing.
+        """
+        if self._signature is None:
+            return False  # nothing observed yet, so there is no baseline
+
+        source = self._get_compositor()
+        if source is None:
+            return False
+
+        rects = source.poll()
+        if rects is None:
+            return False
+        if rects:
+            return False
+
+        self.compositor_skips += 1
+        return True
 
     def reset(self):
         """Forget prior state, so the next frame counts as entirely dirty."""
         self._signature = None
         self._size = None
+
+    def close(self):
+        """Release the compositor source, if one was created."""
+        if self._compositor is not None:
+            self._compositor.close()
+            self._compositor = None
 
     def update(self, image: Image.Image) -> list[Region]:
         """

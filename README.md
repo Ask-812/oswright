@@ -178,9 +178,10 @@ Measured on this machine over a 14-step agent loop:
 
 | | v0.4.0 (full OCR + screenshot) | incremental |
 |---|---|---|
-| Median latency per step | 185 ms | **71 ms** |
-| Tokens per observation | ~2,764 | **~84** |
-| Tokens over 14 steps | 38,696 | **1,800** |
+| Median latency per step | 185 ms | **33 ms** |
+| Tokens per observation | ~2,764 | **~49** |
+| Tokens over 14 steps | 38,696 | **3,930** |
+| Lookup of already-known text | 318 ms | **0.055 ms** |
 | Screen re-read | 100% | **11.5%** |
 
 ### The resolution cascade
@@ -213,8 +214,26 @@ milliseconds of cross-process COM — it is the accurate rung, not the fast one.
 > Neither pixels nor accessibility wins everywhere, which is why this is a
 > cascade rather than a choice.
 
+### Asking the compositor instead of looking
+
+On Windows, the desktop compositor already knows which pixels changed and
+exposes them through DXGI Desktop Duplication. Asking it costs **0.14 ms and
+transfers no pixels**, against ~48 ms to capture a frame and discover it was
+identical — so an idle observation skips the capture entirely.
+
+The compositor is used only as a fast *negative*. When it reports a change, the
+regions still come from hashing the captured frame: the two are measured over
+slightly different intervals, so compositor rectangles can under-report relative
+to the pixels actually captured, and an under-reported region is text that never
+gets re-read. It degrades silently to tile hashing wherever Desktop Duplication
+is unavailable.
+
 Enable delta observations for action tools with `--observation-mode delta`.
 The default remains `screenshot` for compatibility with existing clients.
+
+**Reproduce all of this yourself:** see [`benchmarks/`](benchmarks/).
+The reasoning behind each decision, including the dead ends, is in
+[`docs/ENGINEERING_LOG.md`](docs/ENGINEERING_LOG.md).
 
 ## Configuration
 
@@ -539,6 +558,7 @@ oswright/
   accessibility.py     # Windows UI Automation (deterministic element finding)
   cache.py             # Screenshot diffing, image hashing, OCR result cache
   _dpi.py              # Process DPI awareness (keeps every API in physical pixels)
+  _dxgi_windows.py     # Compositor dirty rectangles via DXGI Desktop Duplication
   input.py             # Platform dispatcher for input backends
   _input_windows.py    # Windows input backend (Win32 API)
   _input_pynput.py     # Linux/macOS input backend (pynput)
@@ -556,16 +576,15 @@ tests/
 
 Deliberately left for later, in rough order of expected value:
 
-- **DXGI dirty rectangles.** Windows' compositor already knows which pixels
-  changed and exposes them via `GetFrameDirtyRects`. OSWright currently computes
-  this itself by hashing tiles. Screen capture is now the largest remaining cost
-  per observation, so this is the next real win.
+- **Read pixels from the DXGI texture already acquired.** Screen capture is now
+  the largest remaining cost per observation (~33–48 ms), and the compositor
+  path already holds the frame — a second `mss` grab is redundant.
 - **A persistent per-application UI atlas.** Applications are deterministic: the
   same dialog has the same layout every time. Caching layouts across sessions
   would make repeat visits close to free.
-- **Speculative perception.** With an atlas and a cheap change oracle, an agent
-  could predict the post-action screen and verify the prediction rather than
-  re-perceiving. Correct predictions would cost nothing.
+- **Speculative perception.** With an atlas and the change oracle that now
+  exists, an agent could predict the post-action screen and verify the
+  prediction rather than re-perceiving. Correct predictions would cost nothing.
 
 ## Development
 
@@ -575,7 +594,11 @@ pip install -e ".[dev]"
 pytest tests/                # everything available on this machine
 pytest tests/ -m "not e2e"   # unit tests only, no desktop needed
 ruff check oswright tests    # lint
+python benchmarks/bench_pipeline.py   # reproduce the performance numbers
 ```
+
+Design decisions, measurements and dead ends are recorded in
+[`docs/ENGINEERING_LOG.md`](docs/ENGINEERING_LOG.md).
 
 ## License
 

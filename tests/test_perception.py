@@ -370,6 +370,93 @@ class TestScreenModel:
         assert "image" not in payload
 
 
+class TestCompositorFastPath:
+    """
+    The compositor is used only as a fast negative.
+
+    It answers "did anything change?" without transferring pixels, which is
+    ~50x cheaper than capturing a frame. But it must never be trusted to say
+    *what* changed: its rectangles are measured over a slightly different
+    interval than the capture that follows, so they can under-report, and an
+    under-reported region is text that never gets re-read.
+    """
+
+    def test_no_baseline_means_no_skip(self):
+        """With nothing observed yet there is no state to preserve."""
+        tracker = DirtyTracker()
+        assert tracker.nothing_changed() is False
+
+    def test_disabled_compositor_never_skips(self):
+        tracker = DirtyTracker(use_compositor=False)
+        tracker.update(frame((640, 480)))
+        assert tracker.nothing_changed() is False
+        assert tracker.compositor_active is False
+
+    def test_unavailable_source_falls_back_silently(self, monkeypatch):
+        tracker = DirtyTracker()
+        tracker.update(frame((640, 480)))
+        monkeypatch.setattr(tracker, "_compositor_tried", True)
+        monkeypatch.setattr(tracker, "_compositor", None)
+        assert tracker.nothing_changed() is False
+
+    def test_skips_only_on_positive_confirmation(self, monkeypatch):
+        """None means 'could not tell' and must not be read as 'unchanged'."""
+        tracker = DirtyTracker()
+        tracker.update(frame((640, 480)))
+
+        class Source:
+            failure_reason = None
+
+            def __init__(self, answer):
+                self.answer = answer
+
+            def poll(self, timeout_ms=0):
+                return self.answer
+
+            def close(self):
+                pass
+
+        tracker._compositor_tried = True
+
+        tracker._compositor = Source(None)          # could not tell
+        assert tracker.nothing_changed() is False
+
+        tracker._compositor = Source([(0, 0, 10, 10)])  # something moved
+        assert tracker.nothing_changed() is False
+
+        tracker._compositor = Source([])            # positively unchanged
+        assert tracker.nothing_changed() is True
+        assert tracker.compositor_skips == 1
+
+    def test_close_is_safe_without_a_source(self):
+        DirtyTracker(use_compositor=False).close()
+
+
+class TestDxgiHelpers:
+    def test_hresult_extraction(self):
+        dxgi = pytest.importorskip("oswright._dxgi_windows")
+
+        class ComLike(Exception):
+            hresult = -2005270489
+
+        assert dxgi._hresult_of(ComLike()) == -2005270489
+        assert dxgi._hresult_of(OSError(5, "denied")) == 5
+        assert dxgi._hresult_of(Exception("no code")) is None
+
+    def test_timeout_constant_matches_dxgi(self):
+        """DXGI_ERROR_WAIT_TIMEOUT is 0x887A0027 as a signed 32-bit HRESULT."""
+        dxgi = pytest.importorskip("oswright._dxgi_windows")
+        assert dxgi.DXGI_ERROR_WAIT_TIMEOUT & 0xFFFFFFFF == 0x887A0027
+
+    def test_source_reports_unavailability_rather_than_raising(self):
+        dxgi = pytest.importorskip("oswright._dxgi_windows")
+        source = dxgi.DxgiDirtySource(output_index=99)  # no such output
+        result = source.poll()
+        assert result is None
+        assert source.failure_reason
+        source.close()
+
+
 class TestCascadeRanking:
     def test_exact_match_outranks_containing_line(self):
         from oswright.cascade import Candidate, _rank

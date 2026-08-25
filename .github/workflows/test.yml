@@ -21,7 +21,7 @@ jobs:
       - name: Install ruff
         run: pip install ruff
       - name: Lint
-        run: ruff check oswright tests
+        run: ruff check oswright tests benchmarks
 
   test-windows:
     runs-on: windows-latest
