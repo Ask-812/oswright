@@ -122,6 +122,13 @@ def run_task(task, meter):
 
     Cleanup lives here rather than in each task body so that a task cannot
     forget it, and so an exception mid-task still closes the window.
+
+    A subject that will not start returns None -- "not run" rather than
+    "failed". An application that never opened has not measured perception, and
+    scoring it as a perception failure would understate whichever configuration
+    happened to hit it. Measured on this machine: VS Code hands the launch off
+    to an existing instance and exits when the user already has one open, which
+    has nothing to do with the thing under test.
     """
     subject = task.subject_factory()
     if not subject.available():
@@ -129,7 +136,10 @@ def run_task(task, meter):
 
     window = subject.launch()
     if window is None:
-        return False, f"{subject.name} did not open"
+        return None, (
+            f"{subject.name} did not open -- it exits when another instance is "
+            f"already running; not counted either way"
+        )
     try:
         return task.body(meter, subject, window)
     finally:
@@ -306,6 +316,22 @@ CONFIGS = {
     "delta + memory": dict(observation_mode="delta", atlas=True, speculate=False),
     "delta + memory + prediction": dict(
         observation_mode="delta", atlas=True, speculate=True),
+
+    # The architectural claim is that neither pixels nor accessibility wins
+    # everywhere, so the cascade routes per query. That has been argued rather
+    # than measured. These two isolate each half.
+    #
+    # "accessibility only" is the posture other Windows GUI agents take, and it
+    # is expected to be blind on Electron. "pixels only" is expected to be blind
+    # on isolated glyphs -- Windows OCR returns no digits at all from
+    # Calculator. If either matches the cascade everywhere, the cascade is
+    # over-engineered and this is how that would be found out.
+    "accessibility only": dict(
+        observation_mode="delta", atlas=False, speculate=False,
+        pixels=False, uia=True),
+    "pixels only": dict(
+        observation_mode="delta", atlas=False, speculate=False,
+        pixels=True, uia=False),
 }
 
 
@@ -313,6 +339,8 @@ def apply(config):
     server._observation_mode = config["observation_mode"]
     server._atlas_enabled = config["atlas"]
     server._speculate_enabled = config["speculate"]
+    server._allow_pixels = config.get("pixels", True)
+    server._allow_uia = config.get("uia", True)
     # Force per-config state to be rebuilt rather than carried over. Closing
     # the old model matters: it holds a borrowed Desktop Duplication, and
     # Windows grants only one per process, so dropping it without releasing

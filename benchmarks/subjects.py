@@ -407,6 +407,11 @@ class VSCode(Subject):
     `--user-data-dir` and `--extensions-dir` on temp directories guarantee a
     clean instance: no real workspace, no extensions, and crucially no restored
     editors with unsaved changes.
+
+    Requires that no other VS Code is already running. When one is, the launcher
+    hands the arguments to the existing instance and exits without opening a
+    window, and the task reports "not run" rather than a failure -- an
+    application that never opened has not measured perception either way.
     """
 
     name = "VS Code"
@@ -478,7 +483,7 @@ class VSCode(Subject):
         window = wait_for_window(
             before,
             lambda t: "Visual Studio Code" in t,
-            timeout=60.0,
+            timeout=45.0,
             settle=4.0,
         )
         if window is not None:
