@@ -297,6 +297,33 @@ analysed, so it cannot disagree with it.
 This trades a further ~7 ms of hashing for a guarantee. That is the right trade
 for a tool whose failure mode is "the agent clicks the wrong thing".
 
+### 2.6 The resolution cascade
+
+Element lookup tries rungs in increasing cost order and stops at the first that
+answers, so cost tracks how *novel* the request is rather than how large the
+screen is.
+
+| Rung | Method | Cost | Why it is where it is |
+|---|---|---|---|
+| 0 | Already in the screen model | **0.055 ms** | No I/O at all |
+| 1 | Rescan what changed | ~33 ms | The common case after acting |
+| 2 | Accessibility tree | ~40–480 ms | Knows a Button *is* a button |
+| 3 | UIA `TextRange.FindText` | ~490 ms | Exact; immune to font/DPI/antialiasing |
+| 4 | Full-screen OCR | ~200 ms | Last resort |
+
+Rung 3 sits below rung 4 despite being *more expensive* because ordering is by
+"try this first", and exactness is worth more than 300 ms when the cheap rungs
+have already failed. It is the rung you trust, not the rung that is fast.
+
+Rung 3 is also the answer to a question worth raising: **OCR solves the wrong
+problem.** OCR is open-vocabulary recognition — "what does this say?" — but an
+agent almost always already knows the string and needs "*where* does it say
+Save?". That is localisation of a known string, a far easier problem. UIA's
+`FindText` does exactly this against the application's own text buffer. A
+literature survey found **no prior art for this reframing in GUI agents**.
+
+---
+
 ### 2.7 Reading pixels from the frame we already hold
 
 Once §2.5 was in place, screen capture was the largest remaining cost per
@@ -440,30 +467,85 @@ infrastructure nobody re-reads. The same run also showed two OCR tests asserting
 that a backend exists, which is false by construction on a runner where OCR is
 deliberately not installed; they now skip.
 
-### 2.6 The resolution cascade
+### 2.11 Not looking at all
 
-Element lookup tries rungs in increasing cost order and stops at the first that
-answers, so cost tracks how *novel* the request is rather than how large the
-screen is.
+Perception had been made cheap. The next step was making it unnecessary.
 
-| Rung | Method | Cost | Why it is where it is |
-|---|---|---|---|
-| 0 | Already in the screen model | **0.055 ms** | No I/O at all |
-| 1 | Rescan what changed | ~33 ms | The common case after acting |
-| 2 | Accessibility tree | ~40–480 ms | Knows a Button *is* a button |
-| 3 | UIA `TextRange.FindText` | ~490 ms | Exact; immune to font/DPI/antialiasing |
-| 4 | Full-screen OCR | ~200 ms | Last resort |
+Two findings drove this, and the first was a surprise.
 
-Rung 3 sits below rung 4 despite being *more expensive* because ordering is by
-"try this first", and exactness is worth more than 300 ms when the cheap rungs
-have already failed. It is the rung you trust, not the rung that is fast.
+**The largest cost in the loop was not perception — it was sleeping.** Every
+action tool ended with `time.sleep(0.3)`, a fixed wait chosen for the slowest
+case, so every action paid the worst case whether or not anything took that
+long. With perception down to ~45 ms, that sleep was six times the cost of the
+work around it.
 
-Rung 3 is also the answer to a question worth raising: **OCR solves the wrong
-problem.** OCR is open-vocabulary recognition — "what does this say?" — but an
-agent almost always already knows the string and needs "*where* does it say
-Save?". That is localisation of a known string, a far easier problem. UIA's
-`FindText` does exactly this against the application's own text buffer. A
-literature survey found **no prior art for this reframing in GUI agents**.
+The compositor already knows when the screen is changing, so the wait can end
+when the interface actually settles:
+
+```
+fixed sleep previously used per action : 300.0 ms
+median time the screen was changing    :   0.0 ms
+median actual wait                     :  61.5 ms
+saved per action                       : 238.5 ms   -> 11.9s over 50 steps
+```
+
+Defining "settled" took a correction. The first implementation waited for *no*
+change and timed out on every single sample, because a real desktop is never
+still: measured while idle, a blinking caret and a ticking clock produce a
+change event roughly every 18 ms, covering a median of 32 pixels. Genuine UI
+changes cover tens of thousands. So the criterion is "nothing *large* recently",
+with the threshold at 4,000 px — far above that noise floor, far below any real
+change.
+
+**The second finding is that a known action does not need observing at all.**
+Applications are deterministic: clicking Save produces the same dialog every
+time. After the first observation the outcome is already known, so it is enough
+to *confirm* the expected screen rather than read it again. Measured, prediction
+is **19–23× cheaper than observing** (2.3 ms versus 43–50 ms).
+
+This is speculative execution applied to perception, and it needed no new
+machinery — the atlas (§2.9) confirms a screen by pixels, and the compositor
+(§2.5) says when to look. What it added was a transition model:
+`(screen, action) → outcome`, learned by watching.
+
+**Three safeguards, each from a failure the tests found.**
+
+*Transitions must be seen twice before being trusted.* One observation could be
+a coincidence.
+
+*Transitions that prove wrong are retired.* A transition predicted wrongly more
+often than rightly is worse than none, so it stops being used.
+
+*Prediction re-checks the layout, not just the sampled regions.* The first
+version went straight to the expected screen and ran only the pixel verifiers,
+skipping the layout-signature check that `recall` does. A change falling outside
+every sampled region therefore went unnoticed. A test caught it; prediction now
+runs both checks, the same pair the atlas uses.
+
+**And a limit that cannot be engineered away.** Verification proves the *layout*
+is the one expected — the same controls in the same places. It does not prove
+every character is identical, and it cannot. A single changed digit alters fewer
+pixels than a blinking caret does:
+
+| Whole-screen grid | a caret appears | a digit changes |
+|---|---|---|
+| 64×36 | 0.00043 | 0.00000 |
+| 128×72 | 0.00033 | 0.00000 |
+| 256×144 | 0.00022 | 0.00000 |
+| 320×180 | 0.00017 | 0.00003 |
+
+The signal is *inverted* at every resolution tried, so no threshold separates
+them. I spent several iterations trying to tune my way out before accepting it
+was structural. Rather than pretend otherwise, the guarantee is stated for what
+it is: a confirmed prediction means the screen is safe to act on, not that
+volatile text such as a clock or a counter is current. `observe(force_full=True)`
+is the escape hatch, and the behaviour is pinned by a test that asserts the
+limitation rather than hiding it.
+
+**A failed prediction is information.** It means the interface did something it
+does not normally do — an unexpected dialog, an error, a slow load — so it is
+reported to the agent as a `surprise` rather than silently absorbed as a cache
+miss.
 
 ---
 
@@ -519,6 +601,18 @@ Worth knowing, because these are the questions an interviewer will ask.
 9. **Let CI bypass a dependency constraint** by re-stating it without the bound
    (§2.10). The pin was right; the pipeline verifying it was not.
 
+10. **Waited a fixed 300 ms after every action** while optimising perception
+    down to 45 ms. The sleep was six times the cost of the work around it
+    (§2.11). Worth checking what actually dominates before optimising.
+11. **Defined "settled" as "no change"**, which never happens on a real
+    desktop — the first implementation timed out on every sample (§2.11).
+12. **Let prediction skip the layout check** that recall performs, so a change
+    outside every sampled region went unnoticed (§2.11). A test caught it.
+13. **Tried to tune my way out of a structural limit.** No whole-screen
+    resolution can distinguish a changed digit from a blinking caret; the
+    signal is inverted at every grid tried (§2.11). The right move was to state
+    the guarantee accurately instead.
+
 Approaches investigated and rejected on evidence:
 
 - **Hooking DirectWrite/GDI to recover text from the render path.** This is
@@ -537,13 +631,14 @@ Approaches investigated and rejected on evidence:
 
 ## Part 5 — What is deliberately not done
 
-- **Speculative perception.** With the atlas (§2.9) and the change oracle
-  (§2.5) both in place, an agent could predict the post-action screen state and
-  verify the prediction rather than re-perceiving. Correct predictions would
-  cost nothing. This is predictive coding applied to GUI agents; the premise
-  (change is sparse) is measured, the transition model is not built.
 - **Wayland input injection**, and macOS `AXTextMarker` as a `TextPattern`
   equivalent.
+- **Transitions keyed on more than the immediately preceding screen.** Some
+  actions depend on state that is not visible, and a one-step model cannot
+  represent that; it currently shows up as a transition that stops being
+  trusted.
+- **A vision-model rung** for surfaces that are neither accessible nor
+  text-legible: games, canvases, image editors.
 
 ---
 
@@ -567,9 +662,11 @@ Approaches investigated and rejected on evidence:
 - *How do you know a cached screen is still valid?* — §2.9. Pixels, not text,
   and it fails closed. Bring the table showing why mean difference was the wrong
   metric.
+- *What does a confirmed prediction actually guarantee?* — §2.11. The layout,
+  not every character. Bring the table showing the signal is inverted, and the
+  test that pins the limitation rather than hiding it.
 - *What is the single biggest remaining cost?* — OCR of the changed regions,
-  now that capture goes through the GPU path and known screens are recalled.
-  Beyond that the next structural win is speculative verification (Part 5).
+  on the observations that still happen at all.
 - *Your numbers vary by 3× between runs — why should I believe them?* — §2.8.
   Because they are ratios measured within a run, and because `benchmarks/` is
   in the repository so you can re-measure.

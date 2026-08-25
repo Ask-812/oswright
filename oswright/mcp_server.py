@@ -86,6 +86,12 @@ _observation_mode: str = "screenshot"
 # a recalled screen is only used after its pixels are spot-checked, so a stale
 # entry is rejected rather than acted on.
 _atlas_enabled: bool = True
+
+# Whether to predict the outcome of an action instead of observing it. Requires
+# the atlas, since a prediction is confirmed by comparing against a remembered
+# screen.
+_speculate_enabled: bool = True
+_transitions = None
 _ocr_languages: list[str] = ["en"]
 _default_timeout: float = 10.0
 _default_poll_interval: float = 0.5
@@ -219,7 +225,61 @@ def _get_model():
         return _model
 
 
-def _observation() -> list:
+def _get_transitions():
+    """Lazy-init the transition model. None unless speculation is usable."""
+    global _transitions
+    if not (_speculate_enabled and _atlas_enabled):
+        return None
+    if _transitions is None:
+        model = _get_model()
+        if model._atlas is None:
+            return None
+        from oswright.speculate import TransitionModel
+
+        _transitions = TransitionModel(model._atlas)
+        logger.info("Transition model loaded: %d known transitions", len(_transitions))
+    return _transitions
+
+
+def _before_action() -> Optional[str]:
+    """Identify the screen we are about to act on, so its outcome can be learned."""
+    transitions = _get_transitions()
+    if transitions is None:
+        return None
+    try:
+        model = _get_model()
+        if not model.elements:
+            model.observe()
+        frame = model._acquire_frame()
+        return transitions.snapshot(
+            frame, model._atlas_context(frame), elements=model.elements
+        )
+    except Exception:
+        logger.debug("Could not snapshot the pre-action screen", exc_info=True)
+        return None
+
+
+def _settle(timeout_s: float = 1.0):
+    """
+    Wait for the interface to finish responding, instead of sleeping blindly.
+
+    Action tools used a fixed 300 ms sleep chosen for the slowest case, so every
+    action paid the worst case. The compositor knows when the screen stops
+    changing and answering costs a fraction of a millisecond, so the wait can
+    end as soon as the interface actually settles. Falls back to the fixed sleep
+    where Desktop Duplication is unavailable.
+    """
+    from oswright.settle import settle_after_action
+
+    try:
+        model = _get_model()
+    except Exception:
+        time.sleep(0.3)
+        return None
+    return settle_after_action(model._tracker, timeout_s=timeout_s)
+
+
+def _observation(before_id: Optional[str] = None, action: Optional[str] = None) -> list:
     """
     Build the post-action observation.
 
@@ -229,20 +289,80 @@ def _observation() -> list:
     receives the handful of strings that actually appeared or disappeared, which
     also states what happened rather than asking the model to spot the
     difference between two pictures.
+
+    When the outcome of this action has been seen before, the expected screen is
+    confirmed rather than re-read, and no OCR runs at all.
     """
     if _observation_mode == "screenshot":
         return [_take_snapshot_image()]
 
     try:
-        delta = _get_model().observe()
+        prediction = _speculate(before_id, action)
+        model = _get_model()
+
+        if prediction is not None and prediction.correct:
+            # The screen is the one we expected, so there is nothing to read.
+            return [json.dumps({
+                "observation": {"changed": True, "from_prediction": True},
+                "prediction": prediction.to_dict(),
+            })]
+
+        delta = model.observe()
+        if before_id and action:
+            _record_outcome(before_id, action)
+
+        payload = {"observation": delta.to_dict()}
+        if prediction is not None and prediction.attempted:
+            payload["prediction"] = prediction.to_dict()
     except Exception as e:
         logger.warning("Delta observation failed, falling back to screenshot: %s", e)
         return [_take_snapshot_image()]
 
-    payload = json.dumps({"observation": delta.to_dict()})
+    text = json.dumps(payload)
     if _observation_mode == "both":
-        return [payload, _take_snapshot_image()]
-    return [payload]
+        return [text, _take_snapshot_image()]
+    return [text]
+
+
+def _speculate(before_id: Optional[str], action: Optional[str]):
+    """
+    Try to confirm the expected outcome instead of observing it.
+
+    Returns a Prediction, or None if speculation is unavailable. On a confirmed
+    prediction the screen model is populated from the remembered screen, so no
+    perception work happens at all.
+    """
+    transitions = _get_transitions()
+    if transitions is None or not before_id or not action:
+        return None
+
+    try:
+        model = _get_model()
+        frame = model._acquire_frame()
+        prediction = transitions.predict_and_verify(
+            before_id, action, frame, model._atlas_context(frame)
+        )
+        if prediction.correct and transitions.last_entry is not None:
+            model.adopt(transitions.last_entry.elements, frame)
+        return prediction
+    except Exception:
+        logger.debug("Speculation failed; observing normally", exc_info=True)
+        return None
+
+
+def _record_outcome(before_id: str, action: str):
+    """Learn what this action actually did, so next time it can be predicted."""
+    transitions = _get_transitions()
+    if transitions is None:
+        return
+    try:
+        model = _get_model()
+        frame = model._acquire_frame()
+        transitions.record(
+            before_id, action, frame, model._atlas_context(frame), model.elements
+        )
+    except Exception:
+        logger.debug("Could not record the action outcome", exc_info=True)
 
 
 def _is_loopback(host: str) -> bool:
@@ -311,8 +431,13 @@ def _act_on_text(
                 "error": f"Text '{text}' not found on screen within {_timeout(timeout)}s",
             })]
 
+        from oswright.speculate import action_key
+
+        key = action_key(action, target=match.text)
+        before = _before_action()
+
         perform(match)
-        time.sleep(0.3)
+        _settle()
 
     return [
         json.dumps({
@@ -321,7 +446,7 @@ def _act_on_text(
             "target": [match.x, match.y],
             "confidence": round(match.confidence, 3),
         }),
-        *_observation(),
+        *_observation(before, key),
     ]
 
 
@@ -601,7 +726,7 @@ def mouse_click(
         return [err]
 
     Mouse.click(x, y, button=button, clicks=clicks)
-    time.sleep(0.3)
+    _settle()
     pos = Mouse.get_position()
     return [
         json.dumps({"action": "click", "button": button, "clicks": clicks, "position": pos}),
@@ -624,7 +749,7 @@ def mouse_double_click(x: Optional[int] = None, y: Optional[int] = None) -> list
         return [err]
 
     Mouse.double_click(x, y)
-    time.sleep(0.3)
+    _settle()
     pos = Mouse.get_position()
     return [
         json.dumps({"action": "double_click", "position": pos}),
@@ -657,7 +782,7 @@ def mouse_scroll(amount: int, x: Optional[int] = None, y: Optional[int] = None) 
         y: Optional Y coordinate to scroll at.
     """
     Mouse.scroll(amount, x, y)
-    time.sleep(0.3)
+    _settle()
     return [
         json.dumps({"action": "scroll", "amount": amount}),
         *_observation(),
@@ -734,11 +859,16 @@ def press_key(key: str) -> list:
     Args:
         key: Key name or combo (e.g., 'Enter', 'Ctrl+A', 'Alt+F4').
     """
+    from oswright.speculate import action_key
+
+    transition_key = action_key("key", target=key)
+    before = _before_action()
+
     Keyboard.press(key)
-    time.sleep(0.3)
+    _settle()
     return [
         json.dumps({"action": "press_key", "key": key}),
-        *_observation(),
+        *_observation(before, transition_key),
     ]
 
 
@@ -1081,7 +1211,7 @@ def focus_window(title: str) -> list:
     from oswright.window import focus_window as _focus_window
 
     win = _focus_window(title=title)
-    time.sleep(0.3)
+    _settle()
 
     if win:
         return [
@@ -1133,7 +1263,7 @@ def minimize_window(title: str) -> list:
     from oswright.window import minimize_window as _minimize_window
 
     success = _minimize_window(title=title)
-    time.sleep(0.3)
+    _settle()
 
     return [
         json.dumps({
@@ -1428,9 +1558,14 @@ def click_element(
         if not result.found:
             return [json.dumps({"action": "click_element", **result.to_dict()})]
 
+        from oswright.speculate import action_key
+
+        key = action_key("click", target=result.best.text)
+        before = _before_action()
+
         x, y = result.best.center
         Mouse.click(x, y, button=button)
-        time.sleep(0.3)
+        _settle()
 
     return [
         json.dumps({
@@ -1440,7 +1575,7 @@ def click_element(
             "source": result.source,
             "duration_ms": round(result.duration_ms, 1),
         }),
-        *_observation(),
+        *_observation(before, key),
     ]
 
 
@@ -1470,13 +1605,17 @@ def read_model_text(query: Optional[str] = None, limit: int = 200) -> str:
 @mcp.tool(annotations=_READONLY)
 def perception_stats() -> str:
     """
-    Report how much perception work the incremental model has avoided.
-    Useful for verifying the screen model is actually saving effort.
+    Report how much perception work has been avoided.
+    Covers incremental scanning, remembered screens, and predicted actions.
     """
-    return json.dumps({
+    payload = {
         "observation_mode": _observation_mode,
         **_get_model().efficiency(),
-    })
+    }
+    transitions = _get_transitions()
+    if transitions is not None:
+        payload["speculation"] = transitions.summary()
+    return json.dumps(payload)
 
 
 # =========================================================================
@@ -1542,7 +1681,7 @@ def click_ui_element(
         name=name, control_type=control_type,
         automation_id=automation_id, window_title=window_title,
     )
-    time.sleep(0.3)
+    _settle()
 
     if el:
         return [
@@ -1692,7 +1831,7 @@ def wait_for_change(
 def main():
     """Run the OSWright MCP server."""
     global _ocr_languages, _default_timeout, _snapshot_max_width
-    global _observation_mode, _atlas_enabled
+    global _observation_mode, _atlas_enabled, _speculate_enabled
 
     parser = argparse.ArgumentParser(
         prog="oswright",
@@ -1746,6 +1885,15 @@ def main():
         ),
     )
     parser.add_argument(
+        "--no-speculate", action="store_true",
+        help=(
+            "Do not predict the outcome of actions. By default OSWright learns "
+            "what an action does and confirms the expected result instead of "
+            "re-reading the screen; a prediction that does not hold falls back "
+            "to reading normally and is reported as a surprise."
+        ),
+    )
+    parser.add_argument(
         "--allow-remote", action="store_true",
         help=(
             "Permit binding to a non-loopback address. OSWright has no "
@@ -1793,6 +1941,9 @@ def main():
 
     _atlas_enabled = not (
         args.no_atlas or os.environ.get("OSWRIGHT_NO_ATLAS", "").strip()
+    )
+    _speculate_enabled = _atlas_enabled and not (
+        args.no_speculate or os.environ.get("OSWRIGHT_NO_SPECULATE", "").strip()
     )
 
     log_level = (

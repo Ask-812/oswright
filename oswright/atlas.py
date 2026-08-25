@@ -22,6 +22,7 @@ This is speculative execution: predict, verify cheaply, and pay the full price
 only when the prediction was wrong.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -81,6 +82,10 @@ THUMBNAIL_MAX_WIDTH = 64
 # genuinely changed ones 0.020 to 0.310.
 THUMBNAIL_CELL_DELTA = 24
 THUMBNAIL_CHANGE_LIMIT = 0.01
+
+# Resolution of the whole-screen content check. Fine enough that changed text
+# registers, coarse enough that a blinking caret is well under one cell.
+CONTENT_GRID = (64, 36)
 
 DEFAULT_MAX_ENTRIES = 250
 
@@ -150,6 +155,22 @@ class Verifier:
         )
 
 
+def _content_thumbnail(image: Image.Image) -> bytes:
+    """
+    A coarse greyscale rendering of the whole screen.
+
+    The sampled verifier regions only prove that the places they cover are
+    unchanged; a difference anywhere else goes unnoticed. The layout signature
+    does cover everything, but it is an edge map at 48x27 and two screens whose
+    text differs while their boxes do not look identical to it.
+
+    This fills that gap: it is content rather than structure, and it covers the
+    whole frame. Still coarse enough that a caret changes well under one cell.
+    """
+    small = image.convert("L").resize(CONTENT_GRID, Image.BILINEAR)
+    return np.asarray(small, dtype=np.uint8).tobytes()
+
+
 def _thumbnail_size(region: Region) -> tuple[int, int]:
     """Thumbnail dimensions for a region, preserving its aspect ratio."""
     if region.height <= 0:
@@ -187,18 +208,40 @@ def _thumbnails_match(a: bytes, b: bytes) -> bool:
     return changed <= THUMBNAIL_CHANGE_LIMIT
 
 
-@dataclass
+@dataclass(eq=False)
 class AtlasEntry:
-    """A remembered screen."""
+    """
+    A remembered screen.
+
+    `eq=False` because the signature is a numpy array: a generated `__eq__`
+    would return an array rather than a bool, and anything using `in` or
+    `list.remove` on these would raise "truth value of an array is ambiguous".
+    Identity comparison is what callers actually want here.
+    """
 
     signature: np.ndarray
     context_key: str
     elements: list[Element] = field(default_factory=list)
     verifiers: list[Verifier] = field(default_factory=list)
+    content: bytes = b""
     hits: int = 0
     misses: int = 0
     created_at: float = field(default_factory=time.time)
     last_used_at: float = field(default_factory=time.time)
+
+    @property
+    def entry_id(self) -> str:
+        """
+        Stable identifier for this remembered screen.
+
+        Derived from content rather than assigned, so it survives saving and
+        reloading and lets other structures (such as the transition model) refer
+        to a screen without holding it.
+        """
+        return hashlib.blake2b(
+            (_pack(self.signature) + "|" + self.context_key).encode(),
+            digest_size=8,
+        ).hexdigest()
 
     def to_dict(self) -> dict:
         return {
@@ -209,6 +252,7 @@ class AtlasEntry:
             "created_at": self.created_at,
             "last_used_at": self.last_used_at,
             "verifiers": [v.to_dict() for v in self.verifiers],
+            "content": self.content.hex(),
             "elements": [
                 {
                     "text": e.text,
@@ -237,6 +281,7 @@ class AtlasEntry:
             context_key=data.get("context_key", ""),
             elements=elements,
             verifiers=[Verifier.from_dict(v) for v in data.get("verifiers", [])],
+            content=bytes.fromhex(data.get("content", "")),
             hits=data.get("hits", 0),
             misses=data.get("misses", 0),
             created_at=data.get("created_at", time.time()),
@@ -444,6 +489,12 @@ class UIAtlas:
             self.stats["rejected"] += 1
             return False
 
+        if entry.content and not _thumbnails_match(entry.content, _content_thumbnail(image)):
+            entry.misses += 1
+            self.stats["rejected"] += 1
+            logger.debug("Atlas entry rejected: screen content differs")
+            return False
+
         for verifier in entry.verifiers:
             current = _thumbnail(image, verifier.region)
             if not _thumbnails_match(verifier.thumbnail, current):
@@ -499,6 +550,7 @@ class UIAtlas:
             return None
 
         signature = layout_signature(image)
+        content = _content_thumbnail(image)
         key = context.key()
         group = self._entries.setdefault(key, [])
 
@@ -509,6 +561,7 @@ class UIAtlas:
                     context_key=key,
                     elements=list(elements),
                     verifiers=verifiers,
+                    content=content,
                     hits=existing.hits,
                     misses=existing.misses,
                     created_at=existing.created_at,
@@ -521,6 +574,7 @@ class UIAtlas:
             context_key=key,
             elements=list(elements),
             verifiers=verifiers,
+            content=content,
         )
         group.append(entry)
         self.stats["stored"] += 1
@@ -592,6 +646,13 @@ class UIAtlas:
         except Exception:
             logger.warning("Could not save atlas to %s", self.path, exc_info=True)
             return False
+
+    def find_by_id(self, entry_id: str) -> Optional[AtlasEntry]:
+        """Look up a remembered screen by its stable identifier."""
+        for entry in self.entries:
+            if entry.entry_id == entry_id:
+                return entry
+        return None
 
     def summary(self) -> dict:
         looked = self.stats["lookups"]

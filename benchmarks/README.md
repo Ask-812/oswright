@@ -9,6 +9,8 @@ python benchmarks/bench_change.py     # how much the screen actually changes
 python benchmarks/bench_methods.py    # cost of each perception method
 python benchmarks/bench_pipeline.py   # v0.4.0 path vs v0.5.0 path, end to end
 python benchmarks/bench_atlas.py      # cost of a return visit to a known screen
+python benchmarks/bench_settle.py     # how long screens really take to respond
+python benchmarks/bench_speculate.py  # predicting an action instead of observing it
 ```
 
 Reference machine: HP EliteBook 840 G8, Intel Iris Xe, 16 GB RAM, 1920×1080 at
