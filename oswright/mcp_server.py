@@ -75,6 +75,13 @@ _model = None
 _capture_lock = threading.Lock()
 _ocr_lock = threading.Lock()
 _model_lock = threading.Lock()
+_tracker_lock = threading.Lock()
+
+# A change tracker owned by the server rather than the screen model. Waiting for
+# the interface to settle needs only the compositor, and routing it through the
+# model would build an OCR engine as a side effect -- which on Linux means
+# loading PyTorch, seconds of work, purely in order to wait.
+_settle_tracker = None
 
 # How action tools report the resulting screen state:
 #   screenshot - a full image every time (default; what every MCP client expects)
@@ -226,9 +233,17 @@ def _get_model():
 
 
 def _get_transitions():
-    """Lazy-init the transition model. None unless speculation is usable."""
+    """
+    Lazy-init the transition model. None unless speculation is usable.
+
+    Speculation only pays off in `delta` mode: in `screenshot` mode a full image
+    is captured and encoded regardless, so predicting the contents saves nothing
+    and would only build an OCR engine to no purpose.
+    """
     global _transitions
     if not (_speculate_enabled and _atlas_enabled):
+        return None
+    if _observation_mode == "screenshot":
         return None
     if _transitions is None:
         model = _get_model()
@@ -259,6 +274,22 @@ def _before_action() -> Optional[str]:
         return None
 
 
+def _get_settle_tracker():
+    """
+    Lazy-init the change tracker used for settling.
+
+    Deliberately separate from the screen model: settling needs the compositor
+    and nothing else, so it must not drag an OCR engine into existence.
+    """
+    global _settle_tracker
+    with _tracker_lock:
+        if _settle_tracker is None:
+            from oswright.dirty import DirtyTracker
+
+            _settle_tracker = DirtyTracker()
+        return _settle_tracker
+
+
 def _settle(timeout_s: float = 1.0):
     """
     Wait for the interface to finish responding, instead of sleeping blindly.
@@ -272,11 +303,11 @@ def _settle(timeout_s: float = 1.0):
     from oswright.settle import settle_after_action
 
     try:
-        model = _get_model()
+        tracker = _get_settle_tracker()
     except Exception:
         time.sleep(0.3)
         return None
-    return settle_after_action(model._tracker, timeout_s=timeout_s)
+    return settle_after_action(tracker, timeout_s=timeout_s)
 
 
 def _observation(before_id: Optional[str] = None, action: Optional[str] = None) -> list:
