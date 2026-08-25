@@ -3,10 +3,12 @@ Element detection module - finds UI elements on screen using OCR and image match
 Analogous to Playwright's selectors and locators.
 """
 
+import difflib
 import importlib.util
 import logging
 import os
 import platform
+import re
 from dataclasses import dataclass, replace
 from typing import Optional
 
@@ -15,6 +17,74 @@ import numpy as np
 from PIL import Image
 
 logger = logging.getLogger(__name__)
+
+# --- Approximate text matching ---------------------------------------------
+#
+# Recognisers do not return a stable identity for a string. Asked for
+# `bravo_notes.txt`, Windows OCR reported `bravo notes.b(t` -- the underscore
+# rendered as a space and the `x` as `(`. The text was plainly on screen and a
+# literal search still missed it, which is a task failure with no perception
+# cause. Separators are the usual casualty: thin, low-contrast, and routinely
+# dropped or substituted.
+#
+# These live at module level because both the OCR engine and the incremental
+# screen model need them, and two copies of a matching rule is how the two
+# quietly drift apart.
+
+_SEPARATORS = re.compile(r"[\s_\-]+")
+
+#: Similarity below which a candidate is not considered at all.
+FUZZY_THRESHOLD = 0.80
+
+#: If the runner-up is within this of the winner, the two are treated as
+#: indistinguishable and nothing is returned. Clicking the wrong element is
+#: worse than reporting a miss, so this fails closed.
+FUZZY_MARGIN = 0.05
+
+#: Short strings fuzz-match almost anything, so they are matched literally or
+#: not at all.
+FUZZY_MIN_LENGTH = 5
+
+
+def normalise_text(text: Optional[str]) -> str:
+    """Lowercase and collapse the separators recognisers most often mangle."""
+    return _SEPARATORS.sub(" ", (text or "").lower()).strip()
+
+
+def fuzzy_select(items: list, target: str, text_of) -> list:
+    """
+    Pick the items whose text approximately matches `target`.
+
+    Used only when a literal search has already found nothing. Deliberately
+    conservative: it refuses rather than guesses when two different strings
+    score alike, and returns every item carrying the winning string, since a
+    recogniser reports the same text as both a word and a line.
+    """
+    goal = normalise_text(target)
+    if len(goal) < FUZZY_MIN_LENGTH:
+        return []
+
+    scored = []
+    for item in items:
+        text = normalise_text(text_of(item))
+        if text:
+            scored.append((difflib.SequenceMatcher(None, goal, text).ratio(), text, item))
+    if not scored:
+        return []
+
+    scored.sort(key=lambda row: row[0], reverse=True)
+    best_ratio, best_text, _ = scored[0]
+    if best_ratio < FUZZY_THRESHOLD:
+        return []
+
+    for ratio, text, _ in scored[1:]:
+        if text == best_text:
+            continue  # same string, different box: not a rival
+        if best_ratio - ratio < FUZZY_MARGIN:
+            return []  # indistinguishable; fail closed
+        break
+
+    return [item for _, text, item in scored if text == best_text]
 
 # --- Detect available OCR backends ---
 _SYSTEM = platform.system()
@@ -250,7 +320,8 @@ class OCREngine:
         return elements
 
     def find_text(
-        self, image: Image.Image, target: str, exact: bool = False
+        self, image: Image.Image, target: str, exact: bool = False,
+        fuzzy: bool = True,
     ) -> list[ElementMatch]:
         """
         Find all occurrences of text on screen.
@@ -259,6 +330,8 @@ class OCREngine:
             image: PIL Image to search in.
             target: Text to find.
             exact: If True, requires exact match. If False, uses substring match.
+            fuzzy: If True, fall back to approximate matching when nothing
+                matched literally. Ignored when `exact` is set.
 
         Returns:
             List of ElementMatch objects sorted by confidence.
@@ -278,8 +351,21 @@ class OCREngine:
 
             matches.append(el)
 
-        matches.sort(key=lambda m: m.confidence, reverse=True)
-        return matches
+        if matches or exact or not fuzzy:
+            matches.sort(key=lambda m: m.confidence, reverse=True)
+            return matches
+
+        return self._fuzzy_find(all_elements, target)
+
+    # Recognisers do not return a stable identity for a string; see
+    # `fuzzy_select` at module level for what that costs and why the fallback
+    # refuses rather than guesses.
+    def _fuzzy_find(self, elements, target: str) -> list[ElementMatch]:
+        """Approximate match, used only when a literal search found nothing."""
+        winners = fuzzy_select(elements, target, lambda el: el.text)
+        return [
+            replace(el, method=(el.method or "ocr") + "+fuzzy") for el in winners
+        ]
 
     def read_all(self, image: Image.Image) -> list[ElementMatch]:
         """Read all text found in the image."""

@@ -32,7 +32,7 @@ from typing import Optional
 from PIL import Image
 
 from oswright.capture import ScreenCapture
-from oswright.detect import OCREngine
+from oswright.detect import OCREngine, fuzzy_select
 from oswright.dirty import DirtyTracker, Region, merge_regions
 
 logger = logging.getLogger(__name__)
@@ -154,6 +154,10 @@ class ScreenModel:
         self._tracker = DirtyTracker()
         self._elements: list[Element] = []
         self._last_total_pixels = 0
+        #: Set when a currency check has already consumed the compositor's
+        #: report of a change, so the next observation does not re-poll and
+        #: wrongly conclude the screen is idle.
+        self._pending_change = False
         self.stats = {
             "observations": 0,
             "full_rescans": 0,
@@ -253,7 +257,16 @@ class ScreenModel:
         # Ask the compositor before capturing anything. On an idle screen this
         # settles the question for a fraction of a millisecond, against ~33 ms
         # to capture a frame and then discover it was identical.
-        if image is None and not force_full and self._tracker.nothing_changed():
+        #
+        # `_pending_change` guards against asking twice: `is_current()` may
+        # already have polled and seen the change, and a second poll would
+        # report nothing new and skip the rescan that change requires.
+        if (
+            image is None
+            and not force_full
+            and not self._pending_change
+            and self._tracker.nothing_changed()
+        ):
             self.stats["observations"] += 1
             self.stats["compositor_skips"] += 1
             return Delta(
@@ -261,6 +274,8 @@ class ScreenModel:
                 total_pixels=self._last_total_pixels,
                 duration_ms=(time.perf_counter() - started) * 1000,
             )
+
+        self._pending_change = False
 
         if image is None:
             image = self._acquire_frame()
@@ -401,6 +416,32 @@ class ScreenModel:
 
     # --- queries ---
 
+    def is_current(self) -> bool:
+        """
+        Whether the model provably describes what is on screen right now.
+
+        True only when the compositor positively confirms nothing has changed
+        since the last observation. A change, or no compositor to ask, both
+        report False.
+
+        This exists because consulting the model unconditionally is unsound.
+        Measured against VS Code, the memory-only lookup returned a confident
+        coordinate belonging to a *previous* window -- (600, 66) for a file
+        that was at (211, 157) -- and the agent clicked empty chrome. The atlas
+        has verified its answers from the start; the model never did, and a
+        Calculator-only benchmark could not see the difference because the
+        window always reopened in the same place.
+        """
+        if not self._elements:
+            return False
+        if self._tracker.nothing_changed():
+            return True
+        # That poll consumed the compositor's account of the change, so record
+        # it: the next observe() must not conclude from a second poll that
+        # nothing has happened and skip the rescan.
+        self._pending_change = True
+        return False
+
     def find(self, text: str, exact: bool = False) -> list[Element]:
         """Search the model. Costs nothing -- no capture, no OCR."""
         needle = text.lower()
@@ -408,6 +449,14 @@ class ScreenModel:
             hits = [e for e in self._elements if e.text.lower() == needle]
         else:
             hits = [e for e in self._elements if needle in e.text.lower()]
+
+        # The model stores recognised text, so it inherits the recogniser's
+        # mangling: a literal search for `bravo_notes.txt` misses the element
+        # holding `bravo notes.b(t`. Same conservative fallback as the OCR
+        # engine, and the same rule -- refuse when two candidates score alike.
+        if not hits and not exact:
+            hits = fuzzy_select(self._elements, text, lambda e: e.text)
+
         return sorted(hits, key=lambda e: (e.region.top, e.region.left))
 
     def efficiency(self) -> dict:
