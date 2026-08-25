@@ -323,6 +323,9 @@ class Chrome(Subject):
     )
     click_settle_s = 0.5
 
+    #: Overridden by the multi-step variant below.
+    PAGE = PAGE
+
     #: Words chosen to be unambiguous to OCR and absent from browser chrome.
     TARGET = "Cormorant"
 
@@ -342,7 +345,7 @@ class Chrome(Subject):
         self._profile = tempfile.mkdtemp(prefix="oswright_chrome_")
         handle, self._page = tempfile.mkstemp(suffix=".html", prefix="oswright_page_")
         with os.fdopen(handle, "w", encoding="utf-8") as fh:
-            fh.write(PAGE)
+            fh.write(self.PAGE)
 
         before = {w.handle for w in list_windows()}
         self._proc = subprocess.Popen([
@@ -385,6 +388,72 @@ class Chrome(Subject):
             except Exception:
                 pass
         self._page = self._profile = None
+
+
+# --------------------------------------------------------------------------
+# Chrome, two steps -- where a cached screen stops being true
+# --------------------------------------------------------------------------
+
+TWO_STEP_PAGE = """<!doctype html>
+<html><head><meta charset="utf-8"><title>oswright bench ready</title>
+<style>
+ body { font-family: Segoe UI, sans-serif; background: #fff; margin: 40px; }
+ button { font-size: 20px; padding: 18px 30px; margin: 12px;
+          background: #f3f3f3; border: 1px solid #999; cursor: pointer; }
+ h1 { font-size: 26px; }
+ #pad { height: 260px; }
+</style></head>
+<body>
+<h1>Perception benchmark fixture, two steps</h1>
+<p>A local file. No network, no accounts, nothing to lose.</p>
+<div id="stage"></div>
+<script>
+// Step two deliberately renders in a different place and with different words,
+// so coordinates read before the first click cannot be reused for the second.
+// That is the point of this fixture: it is the cheapest possible reproduction
+// of an interface that moves while an agent is working on it.
+function stageTwo() {
+  document.title = 'oswright bench stage two';
+  document.getElementById('stage').innerHTML =
+    '<div id="pad"></div>' +
+    '<button onclick="finish()">Kestrel</button>' +
+    '<button>Petrichor</button>' +
+    '<button>Zamboni</button>';
+}
+function finish() {
+  document.title = 'oswright bench picked Cormorant then Kestrel';
+}
+document.getElementById('stage').innerHTML =
+  '<button>Marigold</button>' +
+  '<button onclick="stageTwo()">Cormorant</button>' +
+  '<button>Zeppelin</button>';
+</script>
+</body></html>
+"""
+
+
+class ChromeTwoStep(Chrome):
+    """
+    The same browser, with an interface that changes under the agent.
+
+    Every other task here is short enough that a tool can read the screen once
+    and reuse those coordinates for every click. That is a real advantage and it
+    is also a special case, so measuring only such tasks quietly favours designs
+    that cache aggressively -- including the cheap Windows-MCP configuration
+    this benchmark reports.
+
+    Here the first click replaces the controls and pushes them 260 px down the
+    page. Coordinates read before it are stale afterwards, and a tool that
+    reuses them clicks blank space. Nothing about that is a trick: it is what
+    every wizard, dialog and navigation does.
+    """
+
+    name = "Chrome (two steps)"
+    PAGE = TWO_STEP_PAGE
+    TARGETS = ["Cormorant", "Kestrel"]
+
+    def succeeded(self, window) -> bool:
+        return "picked Cormorant then Kestrel" in (self.ground_truth(window) or "")
 
 
 # --------------------------------------------------------------------------
