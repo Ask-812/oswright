@@ -109,6 +109,12 @@ SCENARIOS = [
         lambda subject, window: f"picked {subject.TARGET}"
         in (subject.ground_truth(window) or ""),
     ),
+    Scenario(
+        "Chrome: two steps",
+        S.ChromeTwoStep,
+        lambda subject, window: list(subject.TARGETS),
+        lambda subject, window: subject.succeeded(window),
+    ),
 ]
 
 
@@ -189,6 +195,7 @@ async def run_windows_mcp(session, subject, window, targets, snapshot_every_acti
     tokens = steps = 0
     snapshot = None
     used_vision = False
+    refreshed = False
 
     async def call(tool, args):
         nonlocal tokens, steps
@@ -205,11 +212,21 @@ async def run_windows_mcp(session, subject, window, targets, snapshot_every_acti
 
     for name in targets:
         if not name:
-            return tokens, steps, "the fixture was not on screen; setup failed", False
+            return tokens, steps, "the fixture was not on screen; setup failed", False, False
         if snapshot is None or snapshot_every_action:
             snapshot = await call("Snapshot", {})
 
         where = find_target(snapshot, name)
+
+        # The cached screen no longer describes the interface. Re-reading is the
+        # correct thing to do and it is recorded, because it means the cheap
+        # configuration was not actually available for this task -- which is the
+        # whole reason a task whose interface moves is worth measuring.
+        if where is None and not snapshot_every_action:
+            snapshot = await call("Snapshot", {})
+            refreshed = True
+            where = find_target(snapshot, name)
+
         if where is None:
             snapshot = await call("Snapshot", {"use_vision": True})
             used_vision = True
@@ -218,13 +235,13 @@ async def run_windows_mcp(session, subject, window, targets, snapshot_every_acti
             return (
                 tokens, steps,
                 f"Snapshot did not locate {name!r}, with or without vision",
-                used_vision,
+                used_vision, refreshed,
             )
 
         await call("Click", {"loc": where})
         time.sleep(subject.click_settle_s)
 
-    return tokens, steps, None, used_vision
+    return tokens, steps, None, used_vision, refreshed
 
 
 # --------------------------------------------------------------------------
@@ -255,6 +272,7 @@ async def main():
     ]
     results = {name: [] for name in arms}
     vision_needed = set()
+    refresh_needed = set()
 
     params = StdioServerParameters(
         command=python,
@@ -287,12 +305,15 @@ async def main():
                                     subject, window, targets
                                 )
                             else:
-                                tokens, steps, error, vision = await run_windows_mcp(
+                                (tokens, steps, error, vision,
+                                 refreshed) = await run_windows_mcp(
                                     session, subject, window, targets,
                                     arm.endswith("(per action)"),
                                 )
                                 if vision:
                                     vision_needed.add(scenario.name)
+                                if refreshed:
+                                    refresh_needed.add(scenario.name)
                             elapsed = time.perf_counter() - started
                             ok = not error and scenario.check(subject, window)
                             runs.append((ok, tokens, steps, elapsed, error))
@@ -342,6 +363,15 @@ async def main():
             + ", ".join(sorted(vision_needed))
             + "\nIts accessibility-tree snapshot could not describe the target, so the"
             "\nrun was retried with a screenshot rather than scored as a miss."
+        )
+
+    if refresh_needed:
+        print(
+            "\nThe snapshot-once arm had to re-read the screen on: "
+            + ", ".join(sorted(refresh_needed))
+            + "\nOn those tasks the cheap configuration does not exist: the interface"
+            "\nmoved, the cached coordinates stopped being true, and the tool had to"
+            "\nlook again. Its cost there is the per-action figure, not the cheap one."
         )
 
     print(

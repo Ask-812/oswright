@@ -208,29 +208,42 @@ Findings from building it, which are worth as much as the tables:
 Every other benchmark here compares oswright to earlier versions of itself,
 which cannot answer the only question a person choosing a tool asks.
 
-Same tasks, three applications, each graded by the application itself. Neither
-tool grades itself. Windows-MCP runs at its own defaults.
+Same tasks, four scenarios, each graded by the application itself. Neither tool
+grades itself. Windows-MCP runs at its own defaults.
 
-| | Calculator | Explorer | Chrome | total tokens |
-|---|---|---|---|---|
-| oswright | 3/3 | 3/3 | 3/3 | **626** |
-| Windows-MCP, snapshot per action | 3/3 | 3/3 | 3/3 | 11,596 |
-| Windows-MCP, snapshot once | 3/3 | 3/3 | 3/3 | 5,757 |
+| | Calculator | Explorer | Chrome | Chrome, 2 steps | passed | tokens |
+|---|---|---|---|---|---|---|
+| oswright | 5/5 | 4/5 | 5/5 | 5/5 | 19/20 | **832** |
+| Windows-MCP, snapshot per action | 5/5 | 5/5 | 5/5 | 5/5 | **20/20** | 14,053 |
+| Windows-MCP, snapshot once | 5/5 | 5/5 | 5/5 | 5/5 | **20/20** | 8,214 |
 
-**Both tools complete every task.** The result is not that one works and the
-other does not -- it is **18.5x less context than its documented loop, 9.2x
-than its cheapest possible use**, for identical outcomes.
+**Windows-MCP was more reliable; oswright was 16.9x cheaper.** oswright dropped
+one click in twenty on a window that had just opened. Reporting that the other
+way round would be the easiest lie in this repository.
 
-The difference is mechanical, not a matter of tuning. Windows-MCP returns the
-screen to the agent -- `Snapshot` renders the accessibility tree as
+The cost difference is mechanical, not a matter of tuning. Windows-MCP returns
+the screen to the agent -- `Snapshot` renders the accessibility tree as
 `(x,y) button "Seven" [action: click]` -- and takes coordinates back through
 `Click`, so a description of the screen is charged to the model's context on
 every action. oswright takes the text and returns the outcome.
 
-Both of its configurations are reported. Snapshotting once is the cheapest
-possible use of the tool and is safe here only because these interfaces do not
-move between clicks; an agent that assumes that in general acts on stale
-coordinates.
+The reliability gap may be caused by the speed: oswright resolves and clicks in
+~100 ms, sometimes before a freshly-focused window is ready for input, where a
+slower loop gives the application time it never had to ask for. Adding a
+pre-action settle made no measurable difference over ten trials, so this is
+recorded as an open question rather than patched on a hunch.
+
+### Why there is a two-step scenario
+
+Every other task here is short enough that a tool can read the screen once and
+reuse those coordinates for every click. That is a real advantage and also a
+special case, and measuring only such tasks quietly favours designs that cache
+aggressively -- including the cheap Windows-MCP configuration this file reports.
+
+In `Chrome, 2 steps` the first click replaces the controls and moves them 325 px
+down the page. The snapshot-once arm **had to re-read the screen** there, which
+is reported in the output. On tasks whose interface moves, its cheap number does
+not exist: its real cost is the per-action one.
 
 **A result in their favour:** their accessibility traversal reads Chrome's page
 content, which oswright's own accessibility rung does not. The ablation finding

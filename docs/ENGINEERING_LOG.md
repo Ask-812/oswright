@@ -60,10 +60,12 @@ content**; pixels-only scores **6/9 on Calculator**, because the button a human
 reads as `7` is *named* `Seven` and Windows OCR returns no digits from
 Calculator at all. Only the cascade passes everywhere.
 
-**Against the incumbent.** Same task, graded by the application:
-**419 tokens against Windows-MCP's 8,048**, both correct. The gap is structural
-— they return the screen to the agent and take coordinates back, so the screen
-is charged to context on every action.
+**Against the incumbent.** Same tasks, graded by the application: **832 tokens
+against Windows-MCP's 14,053** — and **19/20 against their 20/20**. Cheaper, and
+slightly less reliable. The cost gap is structural, because they return the
+screen to the agent and take coordinates back; the reliability gap is probably
+the same speed cutting the other way, clicking before a just-opened window is
+ready.
 
 **What it is not.** One laptop, four applications, short tasks. As a *product*
 Windows-MCP is far ahead: OAuth, analytics, a watchdog, an installer, real
@@ -925,21 +927,43 @@ defaults, and I measured **its best case as well as its prescribed one**,
 because a comparison that only reports the unflattering configuration is an
 advertisement.
 
-| | Calculator | Explorer | Chrome | total tokens |
-|---|---|---|---|---|
-| oswright | 3/3 | 3/3 | 3/3 | **626** |
-| Windows-MCP, snapshot per action | 3/3 | 3/3 | 3/3 | 11,596 |
-| Windows-MCP, snapshot once | 3/3 | 3/3 | 3/3 | 5,757 |
+| | Calculator | Explorer | Chrome | Chrome, 2 steps | passed | tokens |
+|---|---|---|---|---|---|---|
+| oswright | 5/5 | 4/5 | 5/5 | 5/5 | 19/20 | **832** |
+| Windows-MCP, snapshot per action | 5/5 | 5/5 | 5/5 | 5/5 | **20/20** | 14,053 |
+| Windows-MCP, snapshot once | 5/5 | 5/5 | 5/5 | 5/5 | **20/20** | 8,214 |
 
-**Both tools complete every task.** The result is not "oswright works and they
-do not" — it is **18.5× less context than its documented loop, 9.2× than its
-cheapest possible use**, for identical outcomes.
+**Windows-MCP was more reliable. oswright was 16.9× cheaper.** That is the
+result, and stating it the other way round would be the easiest lie in this
+repository — I built the harness, I chose the tasks, and a single dropped click
+would have been trivially explained away as noise.
 
-Three things keep that honest. Snapshotting once is safe here only because these
-interfaces do not move between clicks — an agent that assumes that in general
-acts on stale coordinates, which is exactly the unsoundness oswright had at
-rung 0, so the 9.2× is measured against a configuration that is not generally
-safe. These are three short tasks on one laptop. And **Windows-MCP's
+It is also the more interesting result. oswright dropped one click in twenty, on
+a window that had just opened, and the likely reason is that **it is fast enough
+to outrun the applications it drives**: it resolves and clicks in ~100 ms, where
+Windows-MCP spends ~600 ms reading the screen first and hands the application
+time it never had to ask for. Speed and reliability are not independent here.
+
+I did not fix it, and that is deliberate. The obvious remedy — settle before
+acting, not only after — made **no measurable difference over ten trials**. My
+own §2.15 entry is about diagnosing a real weakness from the wrong evidence, and
+implementing a second fix on a second unconfirmed hypothesis in the same project
+would be the same mistake wearing a different hat. It is written down as an open
+question with the measurement attached.
+
+**Why there is a two-step scenario.** Every other task here is short enough that
+a tool can read the screen once and reuse those coordinates. That is a real
+advantage and also a special case, and a benchmark made only of such tasks
+quietly favours designs that cache aggressively — including the cheap
+Windows-MCP configuration I was reporting. So one fixture moves: the first click
+replaces the controls and pushes them 325 px down the page. The snapshot-once
+arm **had to re-read the screen** there, which the harness reports. On tasks
+whose interface moves, its cheap number does not exist; its real cost is the
+per-action one.
+
+Three things keep the headline honest. Snapshotting once is safe only where the
+interface does not move, and now there is a measurement of that rather than an
+assertion. These are four short tasks on one laptop. And **Windows-MCP's
 accessibility traversal reads Chrome's page content, which oswright's own
 accessibility rung does not** — so §2.16's "accessibility-only is blind on web
 content" is a statement about *oswright's* UIA rung, not about accessibility
@@ -1076,6 +1100,15 @@ Worth knowing, because these are the questions an interviewer will ask.
     its output; it clicked the wrong buttons and the harness recorded `9,999` as
     a Windows-MCP failure (§2.17). When you build the apparatus that measures
     someone else's tool, every bug in it defaults to their disadvantage.
+27. **Built a benchmark suite entirely out of tasks that suited me.** Every task
+    was short enough that a competitor could read the screen once and reuse the
+    coordinates, which flatters caching designs and hides the cost of an
+    interface that moves. One fixture now moves 325 px between clicks, and the
+    cheap configuration stops existing there (§2.17).
+28. **Read one flaky result as a finding, twice in one project.** A 2/3 on the
+    two-step task looked like a real oswright weakness; at five repeats it was
+    5/5. The genuine weakness was elsewhere and smaller — 19/20 overall — and I
+    would have documented the wrong one (§2.17).
 
 Approaches investigated and rejected on evidence:
 
@@ -1126,19 +1159,21 @@ Approaches investigated and rejected on evidence:
 - *How do you know a cached screen is still valid?* — §2.9. Pixels, not text,
   and it fails closed. Bring the table showing why mean difference was the wrong
   metric.
-- *Is this better than Windows-MCP or the other GUI agents?* — On the measured
-  tasks, **both tools complete everything**; the difference is cost. Across
-  three applications oswright spends **626 tokens against 11,596** for the same
-  work, or 5,757 at their cheapest possible configuration (§2.17). The
-  mechanism is that Windows-MCP returns the screen to the agent and takes
-  coordinates back, so the screen is charged to context on every action. Say
-  the scope in the same breath: three short tasks, one laptop. **As a product
-  it is not close** — they have OAuth, analytics, a watchdog, an installer, a
-  vendored UIA library and actual users.
-- *Did the comparison turn up anything in their favour?* — Yes, and it is in
-  the log: **their accessibility traversal reads Chrome's page content, which
-  oswright's own accessibility rung does not** (§2.17). So the ablation finding
-  is about my UIA rung, not about accessibility APIs generally.
+- *Is this better than Windows-MCP or the other GUI agents?* — Cheaper, and
+  slightly less reliable. Across four scenarios oswright spends **832 tokens
+  against 14,053** for the same work, and passed **19/20 where Windows-MCP
+  passed 20/20** (§2.17). Give both numbers; the comparison is mine and
+  reporting only the flattering half of it would be worthless.
+- *Why did you lose that one click?* — Most likely because oswright is fast
+  enough to outrun the application: it clicks in ~100 ms, where a slower loop
+  hands a freshly-opened window time it never had to ask for. **Speed and
+  reliability are not independent.** I did not fix it, because the obvious
+  remedy made no measurable difference over ten trials and guessing twice is
+  not a method.
+- *Did the comparison turn up anything else in their favour?* — Yes, twice.
+  Their accessibility traversal reads Chrome's page content, which oswright's
+  own accessibility rung does not, and their slower loop is more forgiving of
+  applications that are not ready (§2.17).
 - *Isn't the ablation result just because you chose the tasks?* — Fair
   challenge, and the honest answer is that the ablations (§2.16) describe
   properties of the surfaces rather than of the tasks: accessibility-only
