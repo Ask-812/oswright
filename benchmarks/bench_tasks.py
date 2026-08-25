@@ -7,8 +7,18 @@ cheaper perception path that quietly degraded accuracy would be worse than no
 optimisation at all. Nothing measured that until this file existed.
 
 Each task drives the real MCP tool surface end to end and is verified against
-the application's own state through UI Automation, not against OCR output --
-checking OCR with OCR would only prove it agrees with itself.
+the application's own state -- through UI Automation, or through the window
+title, which the OS reports directly. Never against OCR: checking OCR with OCR
+would only prove it agrees with itself. See `subjects.py`.
+
+The corpus deliberately spans surfaces of increasing difficulty, because
+Calculator alone is the easiest case Windows has and a claim resting on it is
+fragile:
+
+    Calculator      XAML, fully exposed to accessibility
+    File Explorer   native Win32 list view
+    Chrome          web content, where OCR and accessibility disagree most
+    VS Code         Electron -- an entire IDE exposing ~18 elements
 
 Every task runs several times per configuration. A single sample cannot
 distinguish "this configuration is worse" from "that click did not register",
@@ -17,85 +27,40 @@ three samples proved too few: one sweep reported 24/36 and the next 36/36
 with no change to the code under test. Raise the count when a result is
 load-bearing.
 
-Safety: Calculator is the only subject. It is stateless, so opening and closing
-it cannot lose anyone's work. Notepad was rejected after it restored a document
-with unsaved changes on launch, which is not something a benchmark should be
-anywhere near. Every task closes what it opened.
+Safety is a design constraint, not an afterthought. Subjects are stateless or
+run against throwaway profiles and purpose-created folders, so no real document,
+tab, login or unsaved buffer is reachable. Notepad was rejected outright after
+launching it restored a document with unsaved changes. Every task closes what it
+opened.
 
 Run:  python benchmarks/bench_tasks.py
       OSWRIGHT_BENCH_REPEATS=5 python benchmarks/bench_tasks.py
+      OSWRIGHT_BENCH_SUBJECTS=Calculator,Chrome python benchmarks/bench_tasks.py
 """
 
 import json
 import os
 import statistics
-import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 
-import uiautomation as auto
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import oswright.mcp_server as server
-from oswright.window import close_window, focus_window, list_windows
+import subjects as S  # noqa: E402
+
+import oswright.mcp_server as server  # noqa: E402
 
 IMAGE_TOKENS_PER_PIXEL = 1 / 750
-CALC_TITLE = "Calculator"
 
 REPEATS = int(os.environ.get("OSWRIGHT_BENCH_REPEATS", "3"))
 
-# Calculator's XAML buttons need a moment to process an invoke before the next
-# one lands. Too short a gap produces dropped clicks that look exactly like
-# perception failures.
-CLICK_SETTLE_S = 0.35
-
-
-# --------------------------------------------------------------------------
-# Subject under test: Calculator
-# --------------------------------------------------------------------------
-
-def launch_calculator(timeout=12.0):
-    """Open a fresh Calculator, focus it, and return its window."""
-    before = {w.handle for w in list_windows()}
-    subprocess.Popen(["calc"], shell=False)
-
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        for w in list_windows():
-            if w.handle not in before and w.title.strip() == CALC_TITLE:
-                # Acting on an unfocused window is unreliable. This is a real
-                # step an agent has to take, not a workaround for the benchmark.
-                focus_window(handle=w.handle)
-                time.sleep(0.8)
-                return w
-        time.sleep(0.3)
-    return None
-
-
-def read_display(window):
-    """
-    Read Calculator's result from the application itself.
-
-    Deliberately not OCR: the point is to check whether the perception layer
-    drove the app correctly, and OCR cannot be both the thing under test and
-    the thing that grades it.
-    """
-    try:
-        root = auto.ControlFromHandle(window.handle)
-        result = root.Control(searchDepth=12, AutomationId="CalculatorResults")
-        if result.Exists(maxSearchSeconds=2):
-            return (result.Name or "").replace("Display is", "").strip()
-    except Exception:
-        pass
-    return None
-
-
-def cleanup(window):
-    if window is not None:
-        try:
-            close_window(handle=window.handle)
-            time.sleep(0.5)
-        except Exception:
-            pass
+#: Restrict the corpus, e.g. while iterating on one subject.
+ONLY = [
+    s.strip()
+    for s in os.environ.get("OSWRIGHT_BENCH_SUBJECTS", "").split(",")
+    if s.strip()
+]
 
 
 # --------------------------------------------------------------------------
@@ -132,6 +97,7 @@ class Meter:
 @dataclass
 class TaskResult:
     task: str
+    subject: str
     config: str
     success: bool
     steps: int
@@ -140,100 +106,192 @@ class TaskResult:
     detail: str = ""
 
 
+@dataclass
+class Task:
+    """A task, the application it runs against, and what it exercises."""
+
+    name: str
+    subject_factory: type
+    body: object
+    exercises: str = ""
+
+
+def run_task(task, meter):
+    """
+    Launch, run, and always clean up.
+
+    Cleanup lives here rather than in each task body so that a task cannot
+    forget it, and so an exception mid-task still closes the window.
+    """
+    subject = task.subject_factory()
+    if not subject.available():
+        return None, f"{subject.name} is not installed on this machine"
+
+    window = subject.launch()
+    if window is None:
+        return False, f"{subject.name} did not open"
+    try:
+        return task.body(meter, subject, window)
+    finally:
+        subject.cleanup(window)
+
+
+def click_by_text(meter, subject, window, label):
+    """
+    Drive one click through the resolution cascade and report where it landed.
+
+    Returns (ok, note). The note records the rung and coordinate, which turns
+    "the answer was wrong" into "rung 0 returned a coordinate outside the
+    window" -- a diagnosis rather than an observation.
+    """
+    out = meter.record(server.click_element(
+        text=label, window_title=subject.window_hint(window)
+    ))
+    payload = json.loads(out[0])
+    if "error" in payload:
+        return False, f"could not click {label!r}: {payload['error'][:60]}"
+    spot = payload.get("clicked") or {}
+    time.sleep(subject.click_settle_s)
+    return True, f"{label}@r{payload.get('rung')}({spot.get('x')},{spot.get('y')})"
+
+
 # --------------------------------------------------------------------------
 # Tasks
 # --------------------------------------------------------------------------
 
-def task_arithmetic_by_label(meter):
+def arithmetic_by_label(meter, subject, window):
     """
     Compute 7 x 8 by finding buttons through the resolution cascade.
 
     A wrong element or a stale coordinate shows up here as a wrong answer
     rather than as a slower benchmark, which is the point.
     """
-    window = launch_calculator()
-    if window is None:
-        return False, "Calculator did not open"
-
-    # Where each click actually landed, and which rung of the cascade decided
-    # it. Costs nothing to collect and turns "the answer was wrong" into
-    # "rung 0 returned a coordinate outside the window", which is a diagnosis.
     trace = []
-    try:
-        for label in ("Seven", "Multiply by", "Eight", "Equals"):
-            out = meter.record(server.click_element(text=label, window_title=CALC_TITLE))
-            payload = json.loads(out[0])
-            if "error" in payload:
-                return False, f"could not click {label!r}: {payload['error'][:60]}"
-            spot = payload.get("clicked") or {}
-            trace.append(
-                f"{label}@r{payload.get('rung')}"
-                f"({spot.get('x')},{spot.get('y')})"
-            )
-            time.sleep(CLICK_SETTLE_S)
+    for label in ("Seven", "Multiply by", "Eight", "Equals"):
+        ok, note = click_by_text(meter, subject, window, label)
+        if not ok:
+            return False, note
+        trace.append(note)
 
-        shown = read_display(window)
-        if shown == "56":
-            return True, ""
-        return False, (
-            f"display showed {shown!r}, expected '56'; "
-            f"window={window.left},{window.top} {window.width}x{window.height}; "
-            + " ".join(trace)
-        )
-    finally:
-        cleanup(window)
+    shown = subject.ground_truth(window)
+    if shown == "56":
+        return True, ""
+    return False, (
+        f"display showed {shown!r}, expected '56'; "
+        f"window={window.left},{window.top} {window.width}x{window.height}; "
+        + " ".join(trace)
+    )
 
 
-def task_arithmetic_by_accessibility(meter):
+def arithmetic_by_accessibility(meter, subject, window):
     """The same sum driven straight through the accessibility tree, as a control."""
-    window = launch_calculator()
-    if window is None:
-        return False, "Calculator did not open"
+    for aid in ("num7Button", "multiplyButton", "num8Button", "equalButton"):
+        meter.record(server.click_ui_element(
+            automation_id=aid, window_title=subject.window_hint(window)
+        ))
+        time.sleep(subject.click_settle_s)
 
-    try:
-        for aid in ("num7Button", "multiplyButton", "num8Button", "equalButton"):
-            meter.record(server.click_ui_element(
-                automation_id=aid, window_title=CALC_TITLE
-            ))
-            time.sleep(CLICK_SETTLE_S)
-
-        shown = read_display(window)
-        return shown == "56", f"display showed {shown!r}, expected '56'"
-    finally:
-        cleanup(window)
+    shown = subject.ground_truth(window)
+    return shown == "56", f"display showed {shown!r}, expected '56'"
 
 
-def task_read_result(meter):
+def read_result_back(meter, subject, window):
     """Add two numbers, then read the answer back off the screen."""
-    window = launch_calculator()
-    if window is None:
-        return False, "Calculator did not open"
+    for aid in ("num4Button", "plusButton", "num5Button", "equalButton"):
+        meter.record(server.click_ui_element(
+            automation_id=aid, window_title=subject.window_hint(window)
+        ))
+        time.sleep(subject.click_settle_s)
 
-    try:
-        for aid in ("num4Button", "plusButton", "num5Button", "equalButton"):
-            meter.record(server.click_ui_element(
-                automation_id=aid, window_title=CALC_TITLE
-            ))
-            time.sleep(CLICK_SETTLE_S)
+    truth = subject.ground_truth(window)
+    if truth != "9":
+        return False, f"Calculator itself shows {truth!r}; the task setup failed"
 
-        truth = read_display(window)
-        if truth != "9":
-            return False, f"Calculator itself shows {truth!r}; the task setup failed"
+    # Find the answer through perception, which is what an agent must do when
+    # an application does not expose its state.
+    found = json.loads(meter.record(server.find_element(text="9")))
+    return bool(found.get("found")), (
+        f"perception {'found' if found.get('found') else 'missed'} the result"
+    )
 
-        # Find the answer through perception, which is what an agent must do
-        # when an application does not expose its state.
-        found = json.loads(meter.record(server.find_element(text="9")))
-        return bool(found.get("found")), (
-            f"perception {'found' if found.get('found') else 'missed'} the result"
-        )
-    finally:
-        cleanup(window)
+
+def select_file_in_explorer(meter, subject, window):
+    """
+    Find a file by the name on screen and select it.
+
+    A real Win32 list view, and a label the benchmark cannot hardcode: Explorer
+    hides known extensions depending on a per-machine setting, so the target is
+    resolved from the live window before the agent is asked to find it.
+
+    The task only ever selects. Nothing is opened, renamed or deleted.
+    """
+    label = subject.target_label(window)
+    if not label:
+        return False, "the fixture file is not listed; setup failed"
+
+    ok, note = click_by_text(meter, subject, window, label)
+    if not ok:
+        return False, note
+
+    selected = subject.ground_truth(window)
+    if selected == label:
+        return True, ""
+    return False, f"Explorer reports {selected!r} selected, expected {label!r}; {note}"
+
+
+def click_button_in_browser(meter, subject, window):
+    """
+    Find a word rendered by a web page and click it.
+
+    Web content is where OCR and accessibility disagree most. The page reports
+    the outcome by changing its own title, so the grade arrives through the
+    window title rather than through anything the perception layer produced.
+    """
+    ok, note = click_by_text(meter, subject, window, subject.TARGET)
+    if not ok:
+        return False, note
+
+    title = subject.ground_truth(window)
+    if f"picked {subject.TARGET}" in (title or ""):
+        return True, ""
+    return False, (
+        f"page title is {title!r}, expected it to name {subject.TARGET!r}; {note}"
+    )
+
+
+def open_file_in_vscode(meter, subject, window):
+    """
+    Find a filename in an Electron sidebar and open it.
+
+    This is the case that decides the architectural argument. VS Code renders
+    its own interface, so the filenames a human reads are largely absent from
+    the accessibility tree -- an accessibility-only agent is blind here, and a
+    pixel reader is not. Graded through the window title, which VS Code sets to
+    the open file.
+    """
+    ok, note = click_by_text(meter, subject, window, subject.TARGET)
+    if not ok:
+        return False, note
+
+    title = subject.ground_truth(window)
+    if subject.TARGET in (title or ""):
+        return True, ""
+    return False, f"title is {title!r}, expected it to name {subject.TARGET!r}; {note}"
 
 
 TASKS = [
-    ("arithmetic by label", task_arithmetic_by_label),
-    ("arithmetic via accessibility", task_arithmetic_by_accessibility),
-    ("read the result back", task_read_result),
+    Task("arithmetic by label", S.Calculator, arithmetic_by_label,
+         "the cascade, on a fully accessible XAML surface"),
+    Task("arithmetic via accessibility", S.Calculator, arithmetic_by_accessibility,
+         "control: the accessibility tree alone"),
+    Task("read the result back", S.Calculator, read_result_back,
+         "reading state the application does not hand over"),
+    Task("select a file", S.Explorer, select_file_in_explorer,
+         "a native Win32 list view, with a runtime-resolved label"),
+    Task("click a word on a page", S.Chrome, click_button_in_browser,
+         "web content, where OCR and accessibility disagree"),
+    Task("open a file from the sidebar", S.VSCode, open_file_in_vscode,
+         "Electron, where the accessibility tree goes blind"),
 ]
 
 
@@ -268,54 +326,104 @@ def apply(config):
     server._transitions = None
 
 
+# --------------------------------------------------------------------------
+# Reporting
+# --------------------------------------------------------------------------
+
+def selected_tasks():
+    if not ONLY:
+        return TASKS
+    return [t for t in TASKS if t.subject_factory.name in ONLY]
+
+
 def main():
+    tasks = selected_tasks()
     print("Task success, which is what perception cost was only ever a proxy for.")
-    print(f"{REPEATS} runs per task per configuration.")
+    print(f"{REPEATS} runs per task per configuration, "
+          f"{len({t.subject_factory.name for t in tasks})} applications.")
     print("=" * 78)
 
     results = []
+    skipped = {}
+
     for config_name, config in CONFIGS.items():
         apply(config)
         print(f"\n### {config_name}")
 
-        for task_name, task in TASKS:
+        for task in tasks:
+            runs = []
             for attempt in range(REPEATS):
                 meter = Meter()
                 started = time.perf_counter()
                 try:
-                    success, detail = task(meter)
+                    success, detail = run_task(task, meter)
                 except Exception as e:
                     success, detail = False, f"{type(e).__name__}: {e}"
                 elapsed = time.perf_counter() - started
 
-                results.append(TaskResult(
-                    task=task_name, config=config_name, success=success,
-                    steps=meter.steps, seconds=elapsed, tokens=meter.tokens,
-                    detail=detail,
-                ))
+                if success is None:  # subject unavailable here
+                    skipped[task.name] = detail
+                    break
+
+                row = TaskResult(
+                    task=task.name, subject=task.subject_factory.name,
+                    config=config_name, success=success, steps=meter.steps,
+                    seconds=elapsed, tokens=meter.tokens, detail=detail,
+                )
+                results.append(row)
+                runs.append(row)
                 if not success:
                     print(f"      run {attempt + 1} failed: {detail}")
 
-            runs = [r for r in results
-                    if r.config == config_name and r.task == task_name]
+            if not runs:
+                continue
             passed = sum(r.success for r in runs)
             mark = "PASS" if passed == len(runs) else ("FLAKY" if passed else "FAIL")
-            print(f"  {mark:<5} {task_name:<30} {passed}/{len(runs)}  "
+            print(f"  {mark:<5} {task.subject_factory.name:<14} {task.name:<30} "
+                  f"{passed}/{len(runs)}  "
                   f"{statistics.median(r.seconds for r in runs):5.1f}s  "
                   f"{int(statistics.median(r.tokens for r in runs)):>6,} tokens")
+
+    if not results:
+        print("\nNothing ran.")
+        return
 
     print("\n" + "=" * 78)
     print(f"\n{'configuration':<36} {'passed':>9} {'median s':>9} {'tokens':>10}")
     print("-" * 68)
     for config_name in CONFIGS:
         rows = [r for r in results if r.config == config_name]
+        if not rows:
+            continue
         passed = sum(r.success for r in rows)
         print(f"{config_name:<36} {passed:>5}/{len(rows):<3} "
               f"{statistics.median(r.seconds for r in rows):>9.1f} "
               f"{sum(r.tokens for r in rows):>10,}")
 
+    # Where each configuration wins or loses is the useful view once the corpus
+    # spans more than one kind of application.
+    names = [t.subject_factory.name for t in tasks
+             if any(r.subject == t.subject_factory.name for r in results)]
+    seen_order = list(dict.fromkeys(names))
+    print(f"\n{'configuration':<36}" + "".join(f"{n:>16}" for n in seen_order))
+    print("-" * (36 + 16 * len(seen_order)))
+    for config_name in CONFIGS:
+        cells = []
+        for name in seen_order:
+            rows = [r for r in results
+                    if r.config == config_name and r.subject == name]
+            cells.append(f"{sum(r.success for r in rows)}/{len(rows)}" if rows else "-")
+        if any(c != "-" for c in cells):
+            print(f"{config_name:<36}" + "".join(f"{c:>16}" for c in cells))
+
     total = sum(r.success for r in results)
     print(f"\n{total}/{len(results)} task runs succeeded")
+
+    if skipped:
+        print("\nNot run here:")
+        for name, why in skipped.items():
+            print(f"  {name}: {why}")
+
     if total < len(results):
         print("\nFailures, which are the useful part:")
         seen = set()
@@ -323,23 +431,6 @@ def main():
             if not r.success and (r.config, r.task) not in seen:
                 seen.add((r.config, r.task))
                 print(f"  {r.config} / {r.task}: {r.detail}")
-
-    print(
-        "\nWhat this establishes: perception cost fell by an order of magnitude\n"
-        "with no loss in what the agent could accomplish. Cheaper did not mean\n"
-        "worse, which is the claim every other benchmark here was only a proxy for.\n"
-        "\n"
-        "Memory and prediction do not pay for themselves over a handful of short,\n"
-        "novel tasks -- they amortise over repeat visits, and there are none here.\n"
-        "\n"
-        "Not measured but worth stating: the label a human reads is not the label\n"
-        "a machine exposes. Windows OCR returned 30 text elements from the\n"
-        "Calculator window (DEG, MC, Function, Trigonometry, log...) and not one\n"
-        "digit -- isolated glyphs on buttons have no line context for a text\n"
-        "recogniser -- while the accessibility tree names that button 'Seven'.\n"
-        "An agent reasoning from a screenshot will ask for the wrong string, and\n"
-        "no amount of perception engineering fixes that."
-    )
 
 
 if __name__ == "__main__":

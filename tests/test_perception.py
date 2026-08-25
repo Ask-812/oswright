@@ -608,18 +608,46 @@ class TestShortQueryRouting:
 
 
 class TestCascadeOrder:
-    def test_model_hit_costs_nothing(self, model):
+    def test_model_hit_costs_nothing_when_current(self, model, monkeypatch):
+        """When the model is provably current, rung 0 answers from memory."""
         from oswright.cascade import resolve
 
         model._ocr.items = [("Save", 100, 200)]
         model.observe(image=TaggedImage(frame((640, 480))))
         calls = model._ocr.calls
 
+        monkeypatch.setattr(model, "is_current", lambda: True)
         result = resolve("Save", model, allow_uia=False, allow_text_pattern=False)
         assert result.found
         assert result.rung == 0
         assert result.rungs_tried == ["model"]
         assert model._ocr.calls == calls, "rung 0 must not perceive anything"
+
+    def test_stale_model_is_never_trusted(self, model, monkeypatch):
+        """
+        A model that cannot be confirmed current must not answer from memory.
+
+        This is the regression a Calculator-only benchmark could not see,
+        because Calculator always reopened in the same place. Against VS Code
+        the unverified rung returned a coordinate from a previous window --
+        (600, 66) for a file at (211, 157) -- and the agent clicked chrome.
+
+        The earlier version of this test asserted only that rung 0 was fast,
+        which is how the behaviour survived: it pinned the optimisation in
+        place and said nothing about whether the answer was right.
+        """
+        from oswright.cascade import resolve
+
+        model._ocr.items = [("Save", 100, 200)]
+        model.observe(image=TaggedImage(frame((640, 480))))
+
+        monkeypatch.setattr(model, "is_current", lambda: False)
+        result = resolve(
+            "Save", model,
+            allow_uia=False, allow_text_pattern=False, allow_full_rescan=False,
+        )
+        assert result.rungs_tried[0] == "model"
+        assert result.rung != 0, "answered from an unverified model"
 
     def test_missing_text_walks_the_cascade(self, model):
         from oswright.cascade import resolve
@@ -688,3 +716,94 @@ def test_tracker_can_reacquire_after_close():
         assert tracker.compositor_active, "tracker stayed dead after close()"
     finally:
         tracker.close()
+
+
+# ---------------------------------------------------------------------------
+# Approximate text matching
+# ---------------------------------------------------------------------------
+#
+# Windows OCR read `bravo_notes.txt` as `bravo notes.b(t`: the underscore came
+# back as a space and the `x` as `(`. The text was plainly on screen and a
+# literal search still missed it, which failed a task for no perception reason.
+# The fallback exists for that, and must refuse rather than guess.
+
+MANGLED = ["alpha_notes.b(t", "bravo notes.b(t", "charlie notes.b(t"]
+
+
+def _named(text, x=0):
+    from oswright.detect import ElementMatch
+
+    return ElementMatch(x=x, y=0, left=x, top=0, width=10, height=10,
+                        confidence=0.9, text=text, method="ocr")
+
+
+class TestFuzzyMatching:
+    def test_recovers_text_the_recogniser_mangled(self):
+        from oswright.detect import fuzzy_select
+
+        got = fuzzy_select(
+            [_named(t, i) for i, t in enumerate(MANGLED)],
+            "bravo_notes.txt", lambda e: e.text,
+        )
+        assert [e.text for e in got] == ["bravo notes.b(t"]
+
+    def test_picks_the_right_one_among_similar_names(self):
+        """Three near-identical filenames must not collapse into one answer."""
+        from oswright.detect import fuzzy_select
+
+        for target, expected in (
+            ("alpha_notes.txt", "alpha_notes.b(t"),
+            ("charlie_notes.txt", "charlie notes.b(t"),
+        ):
+            got = fuzzy_select(
+                [_named(t, i) for i, t in enumerate(MANGLED)],
+                target, lambda e: e.text,
+            )
+            assert [e.text for e in got] == [expected]
+
+    def test_refuses_when_two_candidates_are_indistinguishable(self):
+        """Clicking the wrong element is worse than reporting a miss."""
+        from oswright.detect import fuzzy_select
+
+        got = fuzzy_select(
+            [_named("bravo notes.b(t", 0), _named("bravo notes.b1t", 1)],
+            "bravo_notes.txt", lambda e: e.text,
+        )
+        assert got == []
+
+    def test_refuses_short_targets(self):
+        """Short strings approximately match almost anything."""
+        from oswright.detect import fuzzy_select
+
+        assert fuzzy_select([_named("ab_x")], "ab", lambda e: e.text) == []
+
+    def test_refuses_unrelated_text(self):
+        from oswright.detect import fuzzy_select
+
+        assert fuzzy_select(
+            [_named("totally different")], "bravo_notes.txt", lambda e: e.text
+        ) == []
+
+    def test_returns_every_box_carrying_the_winning_text(self):
+        """A recogniser reports the same string as both a word and a line."""
+        from oswright.detect import fuzzy_select
+
+        got = fuzzy_select(
+            [_named("bravo notes.b(t", 0), _named("bravo notes.b(t", 500)],
+            "bravo_notes.txt", lambda e: e.text,
+        )
+        assert len(got) == 2
+
+    def test_literal_match_is_preferred_and_unchanged(self, model):
+        """The fallback must never alter what a literal search already answers."""
+        model._ocr.items = [("Save", 100, 200), ("Saved", 300, 400)]
+        model.observe(image=TaggedImage(frame((640, 480))))
+
+        hits = model.find("Save")
+        assert {h.text for h in hits} == {"Save", "Saved"}
+
+    def test_model_recovers_mangled_text(self, model):
+        model._ocr.items = [("bravo notes.b(t", 100, 200)]
+        model.observe(image=TaggedImage(frame((640, 480))))
+
+        assert [h.text for h in model.find("bravo_notes.txt")] == ["bravo notes.b(t"]

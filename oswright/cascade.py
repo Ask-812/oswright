@@ -177,11 +177,19 @@ def resolve(
         result.duration_ms = (time.perf_counter() - started) * 1000
         return result
 
-    # Rung 0 -- what the model already knows. No capture, no OCR, no IPC.
+    # Rung 0 -- what the model already knows, but only when the compositor can
+    # confirm the model still describes the screen. No capture, no OCR, no IPC.
+    #
+    # Answering from memory *without* that confirmation is unsound, and it
+    # fails as a wrong click rather than a slow one: against VS Code this rung
+    # returned (600, 66) for a file that was at (211, 157), left over from a
+    # previous window. The check costs a fraction of a millisecond, because the
+    # compositor is already tracking the answer.
     result.rungs_tried.append("model")
-    hits = model.find(query, exact=exact)
-    if hits:
-        return finish(_from_elements(hits, 0), 0, "model")
+    if model.is_current():
+        hits = model.find(query, exact=exact)
+        if hits:
+            return finish(_from_elements(hits, 0), 0, "model")
 
     # For targets OCR cannot see at all, go straight to the accessibility tree
     # rather than paying for two pixel passes that are certain to miss.
