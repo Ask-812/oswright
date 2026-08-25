@@ -24,6 +24,68 @@ It is slow, it is compute-heavy, and it is extremely expensive in tokens.
 
 ---
 
+## The three-minute version
+
+For when there is no time to read the rest.
+
+**The measurement that started it.** On a live desktop, the median observation
+changes **0.012% of the screen's pixels**. Re-reading everything does roughly
+eight thousand times more work than the change warrants, and it charges the
+model ~2,800 image tokens whether anything happened or not.
+
+**What was built.** A screen model that persists between observations and
+rescans only what moved, fed by four things that had not been combined in a GUI
+agent before: the compositor's own dirty rectangles via hand-written DXGI
+Desktop Duplication bindings (0.14 ms to establish "nothing changed", against
+~33 ms to capture a frame and discover it); a resolution cascade that tries the
+cheapest source that can answer, from memory through incremental OCR to the
+accessibility tree; a screen atlas that recognises previously-seen screens and
+**verifies by pixels, not by re-reading text**; and settle detection that waits
+as long as the interface actually takes rather than a fixed sleep.
+
+**What it cost, measured end to end:** per-step latency 212 ms → 33 ms, tokens
+per observation ~2,764 → ~49, post-action wait 300 ms → 61.5 ms.
+
+**Why the numbers are trustworthy.** Cost is a proxy. Task success is not, so
+there is a harness that drives the real tool surface across four applications
+and grades every task against *the application's own state* — UI Automation, or
+the window title — never against OCR, because grading OCR with OCR only proves
+it agrees with itself. Across four configurations, accuracy is identical and
+token cost falls **23×**.
+
+**Why the architecture is what it is.** The claim that neither pixels nor
+accessibility wins everywhere is measured, not asserted. Turned off one at a
+time: accessibility-only scores **0/3 on a Win32 list view and 0/3 on web
+content**; pixels-only scores **6/9 on Calculator**, because the button a human
+reads as `7` is *named* `Seven` and Windows OCR returns no digits from
+Calculator at all. Only the cascade passes everywhere.
+
+**Against the incumbent.** Same task, graded by the application:
+**419 tokens against Windows-MCP's 8,048**, both correct. The gap is structural
+— they return the screen to the agent and take coordinates back, so the screen
+is charged to context on every action.
+
+**What it is not.** One laptop, four applications, short tasks. As a *product*
+Windows-MCP is far ahead: OAuth, analytics, a watchdog, an installer, real
+users. And wall-clock barely moved, because perception was never the bottleneck
+for these tasks — the win is tokens and per-observation latency.
+
+**The three findings I would lead with in an interview:**
+
+1. **A composition bug that every isolated test passed.** Windows grants one
+   Desktop Duplication per process; oswright built two, so the compositor path
+   I had designed and benchmarked was silently disabled for half the system
+   (§2.13). 221 passing tests could not see it.
+2. **The benchmark became part of the screen it measured.** Its own console
+   output contained the labels it was searching for, and the agent clicked
+   them — exposing that `window_title` constrained only the accessibility
+   rungs, so an automation tool could act on the wrong application (§2.15).
+3. **I fixed a real bug for the wrong reason and wrote that down** (§2.15),
+   along with driving a competitor's API wrongly and nearly publishing the
+   result as their defect (§2.17).
+
+---
+
 ## Part 1 — Correctness audit (v0.4.0)
 
 Before optimising anything, the existing code had to be trustworthy. Several
@@ -1060,13 +1122,39 @@ Approaches investigated and rejected on evidence:
 - *How do you know a cached screen is still valid?* — §2.9. Pixels, not text,
   and it fails closed. Bring the table showing why mean difference was the wrong
   metric.
-- *Is this better than Windows-MCP or the other GUI agents?* — Not as a
-  product: they have OAuth, analytics, virtual-desktop management, a watchdog,
-  a vendored UIA library and actual users. Perception is where this wins, and
-  it is measured (§2.2, §2.11). Task success across the two has not been
-  compared, and saying otherwise would be a claim without evidence (§2.12).
-- *What would settle that?* — Running `bench_tasks.py` against both, on the
-  same tasks. The harness exists; the comparison does not.
+- *Is this better than Windows-MCP or the other GUI agents?* — On the measured
+  task, yes, and by a structural margin rather than a tuned one: **419 tokens
+  against 8,048** for the same four clicks, both correct, graded by the
+  application (§2.17). The mechanism is that Windows-MCP returns the screen to
+  the agent and takes coordinates back, so the screen is charged to context on
+  every action. Say the scope in the same breath: one task, one application,
+  one laptop. **As a product it is not close** — they have OAuth, analytics, a
+  watchdog, an installer, a vendored UIA library and actual users.
+- *Isn't that just because you chose the task?* — Fair challenge. The ablations
+  are the better answer (§2.16): accessibility-only scores **0/3 on a Win32
+  list view and 0/3 on web content**, and pixels-only scores **6/9 on
+  Calculator**, because the button a human reads as `7` is *named* `Seven`.
+  Those are properties of the surfaces, not of a task I picked.
+- *How do you know your comparison was fair?* — The rules were fixed before the
+  first run, and one of them caught me: the first result recorded Windows-MCP
+  failing, and the failure was my adapter calling their API wrongly (§2.17).
+  When you build the apparatus that measures a competitor, every bug in it
+  defaults to their disadvantage.
+- *Why is wall-clock nearly flat if perception is 23× cheaper?* — Because
+  perception was never the bottleneck for these tasks. They are dominated by
+  application start-up and the deliberate settle between clicks. The win is in
+  **tokens and per-observation latency**, and saying otherwise would be
+  overselling a real result.
+- *What is the most embarrassing bug you found?* — Two candidates, both found
+  only by running the whole system. Desktop Duplication was silently disabled
+  for half of oswright because Windows grants one per process and it built two
+  (§2.13). And `window_title` constrained only the accessibility rungs, so a
+  request to click "Eight" in Calculator clicked the word "Eight" **in my own
+  terminal** (§2.15). Every component passed in isolation for both.
+- *Have you ever fixed the right thing for the wrong reason?* — Yes, and it is
+  written down (§2.15). I attributed a misplaced click to a stale screen model,
+  built a currency check, and later found the coordinate was inside my own
+  window. The fix is sound and the reasoning behind it was wrong.
 - *What does a confirmed prediction actually guarantee?* — §2.11. The layout,
   not every character. Bring the table showing the signal is inverted, and the
   test that pins the limitation rather than hiding it.
