@@ -192,21 +192,41 @@ comparison measures 6.5× on a quiet desktop and **14.3×** with a dense web pag
 open. Re-measure with [`benchmarks/`](benchmarks/) rather than trusting these.
 
 Cost is a proxy, though, and a cheaper perception path that quietly degraded
-accuracy would be worse than none. So it is checked against task completion —
-60 scripted runs driving the real tool surface, graded against Calculator's own
-state through UI Automation rather than against OCR output:
+accuracy would be worse than none. So it is checked against task completion:
+scripted tasks driving the real tool surface across four applications, graded
+against each application's own state — UI Automation for Calculator and
+Explorer, the window title for Chrome and VS Code — never against OCR.
 
-| configuration | passed | tokens |
-|---|---|---|
-| v0.4-style (full screenshot, no memory) | 15/15 | 170,690 |
-| delta only | 14/15 | **8,622** |
-| delta + memory | 15/15 | 9,052 |
-| delta + memory + prediction | 15/15 | 12,916 |
+| configuration | Calculator | File Explorer | Chrome | tokens |
+|---|---|---|---|---|
+| v0.4-style (full screenshot) | 9/9 | 3/3 | 3/3 | 118,858 |
+| delta only | 9/9 | 3/3 | 3/3 | **5,252** |
+| delta + memory | 9/9 | 3/3 | 3/3 | 5,099 |
+| delta + memory + prediction | 9/9 | 3/3 | 3/3 | 7,981 |
 
-**Accuracy is flat across every configuration while token cost falls 19.8×.**
-The one failure was a dropped click that the harness caught and attributed to
-the application, not to perception. Run it with
-`python benchmarks/bench_tasks.py`.
+**Accuracy is identical across every configuration while token cost falls 23×.**
+Run it with `python benchmarks/bench_tasks.py`.
+
+### Why both pixels and accessibility
+
+The design bets that neither perception path wins everywhere. Turning each half
+off measures that rather than asserting it:
+
+| configuration | Calculator | File Explorer | Chrome |
+|---|---|---|---|
+| full cascade | **9/9** | **3/3** | **3/3** |
+| accessibility only | 9/9 | **0/3** | **0/3** |
+| pixels only | **6/9** | 3/3 | 3/3 |
+
+Accessibility-only — the posture most Windows GUI agents take — is perfect on
+XAML and blind on a Win32 list view and on web content. Probed against VS Code
+it sees **18 elements**, the entire IDE being a single node named `Chrome Legacy
+Window`, while OCR reads 94 including every filename.
+
+Pixels-only fails Calculator's buttons, because the button a human reads as `7`
+is *named* `Seven`, and Windows OCR returns no digits from Calculator at all.
+
+The cascade is the only configuration that passes everywhere.
 
 ### The resolution cascade
 
@@ -674,14 +694,16 @@ about 32 pixels, while genuine UI changes cover tens of thousands.
 ### What is measured, and what is not
 
 Perception **cost** and task **success** are both measured on this machine and
-reproducible via `benchmarks/` — cheaper perception does not cost accuracy.
+reproducible via `benchmarks/` — across four applications, cheaper perception
+does not cost accuracy, and the pixel/accessibility split is measured rather
+than argued.
 
-What is *not* established is a head-to-head against other GUI agents. The task
-suite is three short Calculator tasks on one Windows 11 laptop, chosen because
-Calculator is stateless and safe to open repeatedly; it is not a broad
-application corpus, and it says nothing about how oswright compares to
-Windows-MCP or any other agent on real work. "Cheaper, with no accuracy loss on
-these tasks" is the claim. "Better agent" is not.
+What is *not* established is a head-to-head against other GUI agents. Four
+applications on one Windows 11 laptop is a corpus, not a survey; it says nothing
+about how oswright compares to Windows-MCP or any other agent on real work, and
+nothing about long multi-step tasks. "Cheaper, with no accuracy loss on these
+tasks, and correct where single-mode designs are blind" is the claim. "Better
+agent" is not.
 
 ## Development
 

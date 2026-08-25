@@ -100,47 +100,93 @@ split is the design: the signature filters, verification guarantees.
 ## `bench_tasks.py` — does any of it help?
 
 Every other benchmark here measures perception *cost*, which is a proxy. This
-one measures whether the agent finishes the job, across four configurations
-from v0.4-style full-screenshot perception to memory plus prediction.
+one measures whether the agent finishes the job, across six configurations and
+four applications of increasing difficulty:
 
-Tasks drive the real MCP tool surface and are verified against **Calculator's
-own state via UI Automation** — grading OCR with OCR would only prove it agrees
-with itself. Each task runs several times per configuration, because a single
-sample cannot distinguish "this configuration is worse" from "that click did
-not register". Set `OSWRIGHT_BENCH_REPEATS` to raise the count when a result
-is load-bearing; three proved too few (see below).
+    Calculator      XAML, fully exposed to accessibility
+    File Explorer   native Win32 list view
+    Chrome          web content, where OCR and accessibility disagree most
+    VS Code         Electron — an entire IDE exposing ~18 elements
 
-**Result, 60 runs:**
+Tasks drive the real MCP tool surface and are graded against **each
+application's own state** — UI Automation for Calculator and Explorer, the
+window title for Chrome and VS Code, where the fixture page reports what was
+clicked by setting `document.title`. Never OCR: grading OCR with OCR would only
+prove it agrees with itself.
 
-| configuration | passed | median | tokens |
+Each task runs several times per configuration, because a single sample cannot
+distinguish "this configuration is worse" from "that click did not register".
+Set `OSWRIGHT_BENCH_REPEATS` to raise the count when a result is load-bearing;
+three proved too few (see below). `OSWRIGHT_BENCH_SUBJECTS` restricts the corpus
+while iterating.
+
+Every subject is stateless or runs against a throwaway profile and a
+purpose-created folder, so no real document, tab, login or unsaved buffer is
+reachable. Notepad is excluded outright: launching it restored a document with
+unsaved changes.
+
+VS Code is reported separately below — it declines to open a new window when
+another instance is already running, and a task that never launched is recorded
+as "not run" rather than as a failure.
+
+**Result, across four applications:**
+
+| configuration | Calculator | File Explorer | Chrome | tokens |
+|---|---|---|---|---|
+| v0.4-style (full screenshot) | 9/9 | 3/3 | 3/3 | 118,858 |
+| delta only | 9/9 | 3/3 | 3/3 | **5,252** |
+| delta + memory | 9/9 | 3/3 | 3/3 | 5,099 |
+| delta + memory + prediction | 9/9 | 3/3 | 3/3 | 7,981 |
+
+**Accuracy is identical across every configuration and token cost falls 23×** —
+cheaper did not mean worse, which is what every other benchmark here was only a
+proxy for.
+
+**Ablations, which measure the architecture rather than asserting it:**
+
+| configuration | Calculator | File Explorer | Chrome |
 |---|---|---|---|
-| v0.4-style (full screenshot, no memory) | 15/15 | 7.2 s | 170,690 |
-| delta only | 14/15 | 6.9 s | 8,622 |
-| delta + memory | 15/15 | 6.8 s | 9,052 |
-| delta + memory + prediction | 15/15 | 6.9 s | 12,916 |
+| full cascade | **9/9** | **3/3** | **3/3** |
+| accessibility only | 9/9 | **0/3** | **0/3** |
+| pixels only | **6/9** | 3/3 | 3/3 |
 
-**59/60. Accuracy is flat across every configuration and token cost falls
-19.8×** — cheaper did not mean worse, which is what every other benchmark here
-was only a proxy for.
+Accessibility-only is the posture other Windows GUI agents take. It is perfect
+on XAML and scores zero on a Win32 list view and on web content. Pixels-only
+fails Calculator's buttons, because the button a human reads as `7` is *named*
+`Seven` and Windows OCR returns no digits from Calculator at all. Only the
+cascade passes everywhere.
 
-The one failure was not a perception failure and the harness said so: Calculator
-itself showed `49` after being driven `4 + 5 =`, so a XAML button dropped an
-invoke. Tasks check the application's own state before grading perception
-precisely so this cannot be misreported.
+**VS Code**, measured in a separate run while no other instance was open:
+3/3 for each of the three main configurations, and **0/3 for accessibility
+only**. The direct probe is more useful than the task score, and reproduces in
+seconds: UI Automation returns **18 elements** for the whole window —
+`Minimize`, `Maximize`, `Restore`, `Close`, and one node named **`Chrome Legacy
+Window`** containing the entire interface — while OCR reads 94 from the same
+frame, including every filename in the sidebar. An accessibility-only agent is
+not merely slower there; it cannot see the application at all.
 
-Read the table with two caveats. **Wall-clock barely moves** because these tasks
-are dominated by Calculator's ~3 s launch and the deliberate 0.35 s settle
-between clicks — perception is a small share of the total, and its latency win
-is the one in `bench_pipeline.py`. And **memory and prediction do not pay for
+Read the tables with two caveats. **Wall-clock barely moves** because these
+tasks are dominated by application start-up and the deliberate settle between
+clicks — perception is a small share of the total, and its latency win is the
+one in `bench_pipeline.py`. And **memory and prediction do not pay for
 themselves here**; they amortise over repeat visits, and a handful of short
 novel tasks contains none.
 
-Findings from building it, which are worth as much as the table:
+Findings from building it, which are worth as much as the tables:
 
+- **The benchmark became part of the screen it measured.** Its own console
+  output contained the labels it was searching for, and the agent clicked them —
+  `Eight` at x=1587, outside a Calculator window ending at x=1185. That exposed
+  a real defect: `window_title` constrained only the accessibility rungs, so the
+  pixel rungs could act on a different application entirely.
+- **OCR is not a stable identity.** `bravo_notes.txt` came back as
+  `bravo notes.b(t`. Approximate matching now runs as a fallback, and refuses
+  when two candidates score alike.
+- **Explorer hides file extensions**, per machine, so the on-screen label is
+  resolved from the live window rather than assumed from the fixture.
 - **It caught a bug 221 tests could not.** Desktop Duplication was silently
   disabled for half the system, because Windows grants one per process and
-  oswright built two (see `ENGINEERING_LOG.md` §2.13). Fixing it is what took
-  the token reduction from 7.2× to 19.8×. Only a full-system run could see it.
+  oswright built two (see `ENGINEERING_LOG.md` §2.13).
 - **Three repeats were not enough.** One sweep reported 24/36 with a task
   failing in all four configurations — a systematic-looking signal that turned
   out to be environmental; the next identical sweep reported 36/36. Reproduce a
