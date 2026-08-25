@@ -919,28 +919,32 @@ tuning:
 - **oswright** takes the text and returns the outcome: `click_element(text=
   "Seven")` resolves internally through the cascade.
 
-Both were run on the same task, the same four buttons, graded by Calculator's
-own UI Automation display. Neither tool grades itself. Windows-MCP ran with its
-own defaults, and I measured **its best case as well as its prescribed one**,
+Both were run on the same tasks across three applications, graded by each
+application itself. Neither tool grades itself. Windows-MCP ran with its own
+defaults, and I measured **its best case as well as its prescribed one**,
 because a comparison that only reports the unflattering configuration is an
 advertisement.
 
-| | passed | tokens | steps | seconds |
+| | Calculator | Explorer | Chrome | total tokens |
 |---|---|---|---|---|
-| oswright | 3/3 | **419** | 4 | **2.7** |
-| Windows-MCP, snapshot per action | 3/3 | 8,048 | 8 | 5.6 |
-| Windows-MCP, snapshot once | 3/3 | 2,033 | 5 | 4.2 |
+| oswright | 3/3 | 3/3 | 3/3 | **626** |
+| Windows-MCP, snapshot per action | 3/3 | 3/3 | 3/3 | 11,596 |
+| Windows-MCP, snapshot once | 3/3 | 3/3 | 3/3 | 5,757 |
 
-**19.2× less context than its documented loop, 4.9× than its cheapest possible
-use, at half the wall-clock, with both tools correct.**
+**Both tools complete every task.** The result is not "oswright works and they
+do not" — it is **18.5× less context than its documented loop, 9.2× than its
+cheapest possible use**, for identical outcomes.
 
-Two things make that honest rather than triumphant. Snapshotting once is only
-safe because Calculator does not move between clicks — an agent that assumes
-that in general is acting on stale coordinates, which is exactly the
-unsoundness oswright had at rung 0 and had to fix, so the 4.9× is measured
-against a configuration that is not generally safe. And this is one task on one
-application: it says nothing about robustness across a corpus, nor about the
-product surface Windows-MCP has and oswright does not.
+Three things keep that honest. Snapshotting once is safe here only because these
+interfaces do not move between clicks — an agent that assumes that in general
+acts on stale coordinates, which is exactly the unsoundness oswright had at
+rung 0, so the 9.2× is measured against a configuration that is not generally
+safe. These are three short tasks on one laptop. And **Windows-MCP's
+accessibility traversal reads Chrome's page content, which oswright's own
+accessibility rung does not** — so §2.16's "accessibility-only is blind on web
+content" is a statement about *oswright's* UIA rung, not about accessibility
+APIs in general. Their tree walk is better than mine there, and the comparison
+turned that up rather than hiding it.
 
 **The mistake worth recording.** The first run reported Windows-MCP failing with
 the display showing `9,999`. I had passed `label=N` to `Click`, having read the
@@ -1123,18 +1127,23 @@ Approaches investigated and rejected on evidence:
   and it fails closed. Bring the table showing why mean difference was the wrong
   metric.
 - *Is this better than Windows-MCP or the other GUI agents?* — On the measured
-  task, yes, and by a structural margin rather than a tuned one: **419 tokens
-  against 8,048** for the same four clicks, both correct, graded by the
-  application (§2.17). The mechanism is that Windows-MCP returns the screen to
-  the agent and takes coordinates back, so the screen is charged to context on
-  every action. Say the scope in the same breath: one task, one application,
-  one laptop. **As a product it is not close** — they have OAuth, analytics, a
-  watchdog, an installer, a vendored UIA library and actual users.
-- *Isn't that just because you chose the task?* — Fair challenge. The ablations
-  are the better answer (§2.16): accessibility-only scores **0/3 on a Win32
-  list view and 0/3 on web content**, and pixels-only scores **6/9 on
-  Calculator**, because the button a human reads as `7` is *named* `Seven`.
-  Those are properties of the surfaces, not of a task I picked.
+  tasks, **both tools complete everything**; the difference is cost. Across
+  three applications oswright spends **626 tokens against 11,596** for the same
+  work, or 5,757 at their cheapest possible configuration (§2.17). The
+  mechanism is that Windows-MCP returns the screen to the agent and takes
+  coordinates back, so the screen is charged to context on every action. Say
+  the scope in the same breath: three short tasks, one laptop. **As a product
+  it is not close** — they have OAuth, analytics, a watchdog, an installer, a
+  vendored UIA library and actual users.
+- *Did the comparison turn up anything in their favour?* — Yes, and it is in
+  the log: **their accessibility traversal reads Chrome's page content, which
+  oswright's own accessibility rung does not** (§2.17). So the ablation finding
+  is about my UIA rung, not about accessibility APIs generally.
+- *Isn't the ablation result just because you chose the tasks?* — Fair
+  challenge, and the honest answer is that the ablations (§2.16) describe
+  properties of the surfaces rather than of the tasks: accessibility-only
+  scores **0/3 on a Win32 list view**, and pixels-only scores **6/9 on
+  Calculator** because the button a human reads as `7` is *named* `Seven`.
 - *How do you know your comparison was fair?* — The rules were fixed before the
   first run, and one of them caught me: the first result recorded Windows-MCP
   failing, and the failure was my adapter calling their API wrongly (§2.17).
