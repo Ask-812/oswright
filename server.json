@@ -1,0 +1,22 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.Ask-812/oswright",
+  "description": "Windows desktop automation that re-reads only what changed: 7x fewer tokens per task.",
+  "status": "active",
+  "repository": {
+    "url": "https://github.com/Ask-812/oswright",
+    "source": "github"
+  },
+  "version": "0.8.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "oswright",
+      "version": "0.8.0",
+      "runtimeHint": "uvx",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

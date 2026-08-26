@@ -1,0 +1,71 @@
+name: Publish to the MCP registry
+
+# The official registry is how MCP clients discover servers. Being absent from
+# it means the only people who can find this are the ones who already know it
+# exists, which is the opposite of the point.
+#
+# Separate from publish.yml on purpose. PyPI refuses to accept a version twice,
+# so that workflow can only ever run once per release -- but a registry entry
+# may need re-publishing without a new version (a corrected description, a
+# schema change, a first listing for a release that already shipped). This one
+# is therefore independently dispatchable.
+#
+# Authentication is OIDC against this repository: GitHub vouches for the
+# `io.github.Ask-812/*` namespace directly, so there is no token to store.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # A registry entry pointing at a version nobody can install is worse than
+      # no entry at all, so check the package really is on PyPI first.
+      - name: Check the version in server.json exists on PyPI
+        run: |
+          VERSION=$(python -c "import json; print(json.load(open('server.json'))['packages'][0]['version'])")
+          NAME=$(python -c "import json; print(json.load(open('server.json'))['packages'][0]['identifier'])")
+          echo "checking $NAME==$VERSION"
+          curl -sf "https://pypi.org/pypi/$NAME/$VERSION/json" > /dev/null || {
+            echo "::error::$NAME==$VERSION is not on PyPI"
+            exit 1
+          }
+
+      - name: Check server.json matches the release
+        if: github.event_name == 'release'
+        env:
+          TAG_NAME: ${{ github.event.release.tag_name }}
+        run: |
+          TAG="${TAG_NAME#v}"
+          SRV=$(python -c "import json; print(json.load(open('server.json'))['version'])")
+          PKG=$(python -c "import json; print(json.load(open('server.json'))['packages'][0]['version'])")
+          echo "tag=$TAG server=$SRV package=$PKG"
+          test "$TAG" = "$SRV" -a "$TAG" = "$PKG" || {
+            echo "::error::server.json is stale: tag $TAG, server $SRV, package $PKG"
+            exit 1
+          }
+
+      - name: Install the registry publisher
+        run: |
+          curl -sL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz" \
+            | tar xz mcp-publisher
+          chmod +x mcp-publisher
+
+      - name: Validate
+        run: ./mcp-publisher validate
+
+      - name: Publish
+        run: |
+          ./mcp-publisher login github-oidc
+          ./mcp-publisher publish
