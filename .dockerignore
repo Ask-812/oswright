@@ -1,0 +1,22 @@
+# The image exists to answer MCP introspection, so it needs the package and
+# nothing else. Excluding the rest keeps the build context small and stops
+# history, benchmarks and screenshots being copied into a published container.
+
+.git
+.github
+docs
+benchmarks
+tests
+dist
+build
+*.egg-info
+__pycache__
+**/__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+.venv
+venv
+POST.md
+CONTRIBUTING.md
+SECURITY.md
