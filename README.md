@@ -1,6 +1,13 @@
 # OSWright
 
+[![PyPI](https://img.shields.io/pypi/v/oswright?color=1f6feb)](https://pypi.org/project/oswright/)
+[![Tests](https://github.com/Ask-812/oswright/actions/workflows/test.yml/badge.svg)](https://github.com/Ask-812/oswright/actions/workflows/test.yml)
+[![Python](https://img.shields.io/pypi/pyversions/oswright)](https://pypi.org/project/oswright/)
+[![License](https://img.shields.io/github/license/Ask-812/oswright?color=444)](LICENSE)
+
 **Desktop automation for AI agents, without paying for a screenshot every step.**
+
+mcp-name: io.github.Ask-812/oswright
 
 An MCP server that lets an LLM drive real desktop applications — the desktop
 equivalent of [Playwright MCP](https://github.com/microsoft/playwright-mcp). It

@@ -1,405 +1,125 @@
-# OSWright — Playwright-like automation, but for your entire desktop
+# Your desktop agent is paying for a screenshot it does not need
 
-Playwright MCP lets AI agents control browsers. But what about everything else — native apps, system dialogs, legacy software, game UIs?
+Every GUI agent I have looked at works the same way: take a screenshot, OCR the
+whole thing, hand the model an image, act, repeat. It is the obvious design, it
+is what I built first, and it is enormously wasteful.
 
-**OSWright** is an open-source MCP server that gives AI agents full control over your desktop using OCR and image matching. It sees your screen the way you do — by reading the text and recognizing visual elements.
+Here is the measurement that changed my mind. On a live desktop, timing real
+interactions rather than synthetic ones, **the median observation changes 0.012%
+of the screen's pixels.** Half of all observations move less than a hundredth of
+a percent of what is on screen.
 
-## How it works
+A full rescan does roughly eight thousand times more work than the change
+warrants, and it bills the model ~2,800 image tokens whether anything happened
+or not.
 
-1. Agent takes a screenshot to see the current screen
-2. Finds buttons, labels, and fields by their visible text (OCR) or by matching template images
-3. Clicks, types, scrolls, drags, fills forms
-4. Every action returns a fresh screenshot so the agent always has context
+## What I built instead
 
-## Use cases
+[OSWright](https://github.com/Ask-812/oswright) keeps a model of the screen
+between observations and re-reads only what moved. Four things make that work,
+and none of them is new technology -- the novelty is applying them here.
 
-- Automating legacy enterprise apps that have no API
-- RPA-style workflows across multiple desktop applications
-- Testing native desktop software with AI
-- Letting AI agents navigate OS-level dialogs (file pickers, installers, system settings)
-- Filling forms across any application
-- Building AI assistants that can actually use your computer
-- Managing windows, clipboard, and launching apps programmatically
+**Ask the compositor what changed.** Windows already tracks dirty rectangles for
+Desktop Window Manager. Desktop Duplication exposes them, so "has anything
+changed?" is answerable in **0.14 ms** without transferring a single pixel,
+against ~33 ms to capture a frame and then discover it was identical. I ended up
+hand-writing the COM bindings, because no Python package exposed the dirty-rect
+metadata.
 
-## What makes it different
+**Try the cheapest source that can answer.** Element lookups go through a
+cascade: what the model already knows, then a rescan of just the changed
+regions, then the accessibility tree, then the application's own text buffer,
+then a full read. A repeat lookup costs ~0.05 ms.
 
-- Works with **any application**, not just browsers
-- **Cross-platform:** Windows, Linux, macOS
-- **Fast OCR on Windows** — uses built-in Windows OCR (instant, zero model download, no PyTorch) with EasyOCR fallback on Linux/macOS
-- Two ways to use it: as an **MCP server** (for AI agents) or as a **Python library** (for scripts)
-- Playwright-style Python API with auto-waiting locators and assertions
-- **36 MCP tools** with auto-snapshot after every action
-- **Window management** — list, focus, close, minimize, and screenshot specific windows
-- **Clipboard access** — read and write system clipboard for data transfer
-- **App launcher** — launch applications and wait for them to load
-- **DPI- and multi-monitor-correct** coordinates, ready to click
-- One-line install, zero config
+**Remember screens, and verify them with pixels.** Returning to a screen you
+have seen before should not cost a full read. It does not -- but verification
+compares *pixels*, never re-read text, because OCR output is not a stable
+identity. The same label came back as `Elevatc` and `Subarr&` on different
+passes.
 
-## Install
+**Wait as long as the interface actually takes.** The fixed 300 ms sleep after
+every action turned out to be six times the cost of the perception it was
+protecting. The compositor knows when the screen stops changing.
+
+Measured end to end over a real agent loop: latency per step **212 ms to 33 ms**,
+tokens per observation **~2,764 to ~49**.
+
+## The part I nearly got wrong
+
+All of that measures *cost*. Cost is a proxy. The metric that matters is whether
+the agent finishes the job, and a cheaper perception path that quietly degraded
+accuracy would be worse than no optimisation at all.
+
+I optimised the proxy for eight versions before checking. When I finally built a
+task harness -- real tasks, driven through the real tool surface, graded against
+each application's own state rather than against OCR -- it immediately broke
+three things Calculator had been hiding, including one where the benchmark's own
+console output contained the words it was searching for, so the agent clicked
+them.
+
+The result, once those were fixed: accuracy identical across every
+configuration, token cost down 23x. But I would not have known, and the honest
+version of this post would have been "here are some numbers I did not check".
+
+## Neither pixels nor accessibility wins
+
+The design bets that no single perception method is enough. That is arguable, so
+I measured it by turning each half off:
+
+| | Calculator | File Explorer | Chrome |
+|---|---|---|---|
+| both | **9/9** | **3/3** | **3/3** |
+| accessibility only | 9/9 | **0/3** | **0/3** |
+| pixels only | **6/9** | 3/3 | 3/3 |
+
+Accessibility-only -- the posture most Windows GUI agents take -- is perfect on
+XAML and blind on a Win32 list view and on web content. Point it at VS Code and
+it sees **18 elements**, the entire IDE being one node named `Chrome Legacy
+Window`, while OCR reads 94 from the same frame.
+
+Pixels-only fails Calculator's buttons, because the button a human reads as `7`
+is *named* `Seven`, and Windows OCR returns no digits from Calculator at all.
+The label a person sees and the label a machine exposes are different strings.
+
+## Against the incumbent
+
+Same tasks, graded by the applications themselves, against
+[Windows-MCP](https://github.com/CursorTouch/Windows-MCP):
+
+| | passed | tokens |
+|---|---|---|
+| oswright | 19/20 | **832** |
+| Windows-MCP, snapshot per action | **20/20** | 14,053 |
+| Windows-MCP, snapshot once | **20/20** | 8,214 |
+
+**They were more reliable. Mine was 16.9x cheaper.** I built the harness and
+chose the tasks, so reporting that the other way round would be the easiest lie
+available.
+
+The cost difference is mechanical rather than a tuning win: Windows-MCP returns
+the screen to the agent and takes coordinates back, so a description of the
+screen is charged to the model's context on every action. OSWright takes the
+text and returns the outcome.
+
+## What it is not
+
+One laptop. Short tasks. Windows only. As a *product* Windows-MCP is far ahead --
+OAuth, analytics, a watchdog, an installer, real users -- and its accessibility
+traversal reads Chrome page content that mine misses.
+
+And wall-clock barely moved, because perception was never the bottleneck for
+these tasks. The win is tokens and per-observation latency. Saying otherwise
+would be overselling a real result.
+
+## Try it
 
 ```
 pip install oswright
 ```
 
-## MCP config
-
-Works with Claude Desktop, VS Code, Cursor, Windsurf, Cline, Goose, and any MCP client:
-
-```json
-{
-  "mcpServers": {
-    "oswright": {
-      "command": "uvx",
-      "args": ["oswright"]
-    }
-  }
-}
-```
-
-## Links
-
-- **GitHub:** https://github.com/Ask-812/oswright
-- **PyPI:** https://pypi.org/project/oswright/
-
----
-
-## Version History
-
-### v0.7.0 — Not looking at all
-
-Perception had been made cheap. This release makes it unnecessary — and starts
-with a finding that reframed the whole loop.
-
-**The largest cost was not perception. It was sleeping.** Every action tool
-ended with `time.sleep(0.3)`, a fixed wait chosen for the slowest case, so every
-action paid the worst case. With perception down to ~45 ms, that sleep was six
-times the cost of the work around it. The compositor knows when the screen stops
-changing, so the wait now ends when the interface actually settles:
-
-```
-fixed sleep previously used per action : 300.0 ms
-median actual wait                     :  61.5 ms
-saved per action                       : 238.5 ms   -> 11.9s over 50 steps
-```
-
-Defining "settled" needed a correction. The first version waited for *no* change
-and timed out on every single sample, because a real desktop is never still: a
-blinking caret and a ticking clock produce a change event roughly every 18 ms,
-covering about 32 pixels. Genuine UI changes cover tens of thousands. The
-criterion is "nothing *large* recently".
-
-**And a known action does not need observing at all.** Applications are
-deterministic, so after the first observation the outcome is already known;
-confirming the expected screen is **19–23× cheaper than reading it** (2.3 ms
-versus 43–50 ms). This is speculative execution applied to perception, and it
-needed no new machinery: the atlas confirms a screen by pixels, the compositor
-says when to look. What it added was a transition model — `(screen, action) →
-outcome`, learned by watching.
-
-Three safeguards, each from a failure a test found: a transition must be seen
-twice before it is trusted; one that proves wrong is retired; and prediction
-re-checks the layout, not just the sampled regions — the first version skipped
-that check, so a change outside every sample went unnoticed.
-
-**A limit that cannot be engineered away.** Verification proves the layout is
-the one expected. It does not prove every character is identical, and it cannot.
-A single changed digit alters *fewer* pixels than a blinking caret:
-
-| Whole-screen grid | a caret appears | a digit changes |
-|---|---|---|
-| 64×36 | 0.00043 | 0.00000 |
-| 256×144 | 0.00022 | 0.00000 |
-| 320×180 | 0.00017 | 0.00003 |
-
-The signal is inverted at every resolution tried. Several iterations went into
-trying to tune out of it before accepting it was structural. So the guarantee is
-stated for what it is — a confirmed prediction means the screen is safe to act
-on, not that a clock or a counter is current — and a test pins the limitation
-rather than hiding it.
-
-A failed prediction is reported as a `surprise`: the interface did something it
-does not normally do, which is worth telling the agent rather than silently
-absorbing as a cache miss.
-
-New: `settle.py`, `speculate.py`, `--no-speculate`,
-`benchmarks/bench_settle.py`, `benchmarks/bench_speculate.py`, 33 new tests.
-
-### v0.6.0 — Screens the agent remembers
-
-Applications are deterministic. The Save dialog looks the same every time it
-opens. Yet the agent re-read all of it on every visit, and again in the next
-session, because nothing remembered what it had learned.
-
-OSWright now remembers screens and reuses them: **125 ms cold read → 1.4 ms
-warm recall, 89× cheaper**, persisted across sessions, with a 5/5 hit rate on a
-live desktop.
-
-A remembered screen is never trusted on recognition alone, because a stale
-layout that gets used is the worst thing this system can do — the agent clicks
-somewhere arbitrary. Recognition and verification are separate jobs:
-
-- A **layout signature** (a downsampled edge map) decides which remembered
-  screen might apply. On a live desktop an idle screen drifts 0.0000 between
-  frames while a structurally different image sits at 0.379 — an enormous gap.
-- **Pixel spot-checks** decide whether it actually does, because at that
-  resolution two screens with the same arrangement but different words look
-  identical.
-
-Two failed approaches worth recording, both now in the engineering log.
-
-**Verifying by re-reading text does not work.** The obvious design — OCR a few
-remembered elements, compare the strings — fails because OCR output is not a
-stable identity. Segmentation depends on the crop, and small text comes back
-garbled: real stored labels here included `'Elevatc'`, `'Con tir'` and
-`'Subarr&'`. Comparing one garbling against a differently-cropped garbling
-rejected screens that were perfectly intact, and tight crops returned nothing at
-all until padded past 64 px. The fix was to stop asking what a region says and
-ask whether it still looks the same.
-
-**Mean absolute difference is the wrong way to compare those pixels.** A small
-change inside a mostly-blank region barely moves the mean: a changed heading
-scored 1.47 against 0.00 for an identical one. Counting *how many cells changed*
-is not diluted by the blank area — 0.000 identical versus 0.020–0.310 changed.
-
-Everything fails closed. No verifiable regions means the screen is not
-remembered at all, since it could only ever be trusted blindly.
-
-New tools: `remember_screen`, `atlas_stats`. `observe` now warm-starts
-automatically. Disable with `--no-atlas`.
-
-Also: the first CI run failed with `No module named 'mcp.server.fastmcp'` — the
-exact breakage v0.4.0 fixed. The Linux job installs with `--no-deps` and
-re-listed the dependencies by hand without the `<2` bound. The constraint was
-right; the pipeline verifying it was not. A constraint stated in two places will
-drift, and the copy usually lives in infrastructure nobody re-reads.
-
-### v0.5.2 — Capture from the GPU
-
-v0.5.1 acquires a compositor frame to learn what changed, then threw those
-pixels away and grabbed the same image again through `mss`. Now it reads them
-directly: **1.5–2.3× faster than `mss`**, verified against an `mss` frame of
-the same screen (0.003% of pixels differed, which is live screen change between
-the two captures).
-
-`MapDesktopSurface` would have made this trivial, but requires the desktop image
-to live in system memory, and it does not here — `DesktopImageInSystemMemory` is
-False and the call returns `DXGI_ERROR_UNSUPPORTED`. The working path is the
-full one: `QueryInterface` to `ID3D11Texture2D`, a CPU-readable staging texture,
-`CopyResource` on the GPU, then `Map` and read BGRA rows honouring `RowPitch`.
-
-That needs `ID3D11DeviceContext::CopyResource`, which sits at vtable slot 40.
-COM dispatches by offset, so all forty preceding methods must occupy their
-slots — generated in a loop rather than hand-written, because one misplaced
-entry is memory corruption rather than an error message.
-
-Two guards worth noting. Desktop Duplication output 0 is the *primary monitor*
-while `mss` monitor 0 is the *whole virtual desktop*; on a multi-monitor setup
-substituting one for the other would put every derived coordinate in the wrong
-place, so the frame is rejected unless its size matches what was expected. And
-a frame only exists if the compositor presented one — on a fully idle screen
-there is nothing to capture, which is harmless because an unchanged screen does
-not need re-reading.
-
-End to end, on a busy screen: **639 ms → 45 ms per step (14.3×)** and
-**38,696 → 1,025 tokens over 14 steps (38×)**.
-
-A note on variance, now documented in the engineering log: absolute timings here
-move by up to 3× between runs, because OCR cost scales with how much text is on
-screen. That is the point — full rescans get worse as the screen gets busier,
-while the incremental path scales with how much *changed*. The same benchmark
-measures 6.5× on a quiet desktop and 14.3× with a dense web page open.
-
-### v0.5.1 — Compositor-driven change detection
-
-The Windows compositor already knows which pixels changed — it has to, in order
-to present efficiently — and exposes it through DXGI Desktop Duplication.
-Computing the same thing by hashing a captured frame is redundant work.
-
-More importantly, `AcquireNextFrame` answers "did anything change?" **without
-transferring any pixels**: 0.14 ms, against ~48 ms to capture a frame and then
-discover it was identical. Most observations during an agent session are of an
-idle screen, so the capture is skipped entirely.
-
-| | v0.4.0 | v0.5.0 | v0.5.1 |
-|---|---|---|---|
-| Median latency per step | 212 ms | 71 ms | **33 ms** |
-| Idle observation | ~212 ms | ~60 ms | **~0.6 ms** |
-
-Measured live, 8 of 15 observations were skipped without capturing anything.
-
-Implementing this meant hand-writing the DXGI COM interfaces via `comtypes`,
-since no Python binding exposes dirty rectangles. Two failures worth recording:
-`D3D11CreateDevice` without declared `argtypes` truncates pointers on 64-bit and
-faults rather than returning an error; and `comtypes` raises `COMError`, which is
-not an `OSError`, so `DXGI_ERROR_WAIT_TIMEOUT` — the *normal* signal meaning
-"nothing changed", arriving on every idle poll — was being treated as fatal.
-
-**Deliberate limitation.** The compositor is used only as a fast *negative*.
-When it reports a change, regions still come from hashing the captured frame,
-because the two are measured over slightly different intervals and compositor
-rectangles can under-report relative to the pixels actually captured. An
-under-reported region is text that never gets re-read, which is the exact
-failure this design exists to prevent. Roughly 7 ms of hashing buys that
-guarantee.
-
-Also added: `benchmarks/` so every performance claim is reproducible, and
-`docs/ENGINEERING_LOG.md` recording the reasoning, the measurements, and the
-dead ends — including the discovery that capturing only dirty regions is *2×
-slower* than one full-screen grab, because `mss` has a fixed ~16.6 ms per-grab
-cost regardless of region size.
-
-### v0.5.0 — Incremental perception
-
-The expensive thing about a GUI agent is not clicking, it is looking. Every
-published agent re-perceives the whole screen on every step: full screenshot,
-full OCR, then hand the model a fresh image and let it work out what changed.
-
-Measured on a live desktop, **the median observation changes 0.012% of pixels.**
-A full rescan therefore does roughly 240× more work than the change warrants,
-and the screenshot it returns costs ~2,800 image tokens whether anything
-happened or not.
-
-v0.5.0 keeps a model of the screen between observations and updates only what
-moved.
-
-**Measured over a 14-step agent loop on a 1920×1080 display:**
-
-| | v0.4.0 | v0.5.0 |
-|---|---|---|
-| Median latency per step | 185 ms | **71 ms** |
-| Tokens per observation | ~2,764 | **~84** |
-| Tokens over 14 steps | 38,696 | **1,800** |
-| Screen re-read per step | 100% | **11.5%** |
-| Lookup of already-known text | 244 ms | **0.05 ms** |
-
-**New**
-
-- `observe` — returns what appeared and disappeared since last time, not a picture.
-- `find_element` / `click_element` — resolution cascade; reports which rung answered.
-- `read_model_text`, `perception_stats`.
-- `--observation-mode delta` makes every action tool return a diff instead of a
-  screenshot. Default stays `screenshot` for compatibility.
-- `oswright/dirty.py`, `screenmodel.py`, `cascade.py`, `textprovider.py`.
-
-**The cascade**
-
-Element lookup stops at the first rung that can answer, so cost tracks how
-*novel* the request is rather than how large the screen is: the screen model
-(~0.05 ms) → an incremental rescan (~70 ms) → the accessibility tree (~40 ms) →
-the application's own text buffer via UIA `TextRange.FindText`, which is exact
-and immune to font/DPI/antialiasing (~400 ms) → full-screen OCR (~250 ms).
-
-The ordering comes from measurement rather than theory. The usual advice is to
-make the accessibility tree primary; on real applications it is not always
-cheaper. Walking Chrome's tree took **537 ms** — slower than a full OCR pass —
-and VS Code exposed only **18 elements** to it. Neither pixels nor accessibility
-wins everywhere, which is exactly why this is a cascade and not a choice.
-
-**Correctness**
-
-Incremental perception is only sound if it cannot silently lose text. Two
-invariants enforce that: anything invalidated is fully rescanned (a dirty region
-is grown until it wholly contains every element it touches, otherwise a region
-clipping a word deletes the element and re-detects only the fragment), and
-elements are never mutated in place.
-
-A control experiment worth recording: OCR is 100% deterministic on an identical
-frame, but full-frame OCR and OCR of a *crop of the same area* agree only ~91%,
-because cutting an image changes how the engine groups glyphs into words
-(`"Placer"` becomes `"Plac"` + `"er"`). Region-based OCR is therefore not
-identical to full-screen OCR by construction. Dirty regions are padded wider
-than they are tall to keep text lines intact.
-
-**Not done yet** — DXGI dirty rectangles (the compositor already knows what
-changed; screen capture is now the largest remaining cost per observation), a
-persistent per-application UI atlas, and speculative perception.
-
-### v0.4.0
-
-Correctness and packaging release. Several of these were install-blocking.
-
-**Fixed — packaging (`pip install oswright` was broken)**
-
-- **`mcp` upper bound.** `mcp[cli]>=1.0` allowed `mcp` 2.x, which removed `mcp.server.fastmcp`. A fresh install produced a server that could not import at all. Now pinned to `<2`.
-- **Windows OCR dependencies were wrong.** The `winocr` extra declared the `winocr` package (which ships `winsdk.*`), but the code imports `winrt.*`. A clean install silently fell back to EasyOCR. The correct `winrt-Windows.*` projections are now default dependencies on Windows — including Foundation, Foundation.Collections and Storage.Streams, which are needed at runtime but never imported directly.
-- **No more PyTorch on Windows.** EasyOCR is now installed only on Linux/macOS, where it is the only backend. A Windows install went from ~2.5 GB to a few MB. Use `pip install "oswright[easyocr]"` to opt in.
-- **Single version source.** `pyproject.toml` and `__init__.py` had drifted apart.
-
-**Fixed — coordinates**
-
-- **Cached OCR results were mutated in place.** Region offsets were added directly to `ElementMatch` objects handed out by the cache, so every cache hit re-applied the offset and coordinates drifted further on each call.
-- **Multi-monitor origins ignored.** Coordinates were image-relative, so any monitor placed left of or above the primary produced clicks offset by the virtual-desktop origin.
-- **DPI mismatch.** On a scaled display, window rectangles were logical pixels while screenshots were physical pixels — and which one you got depended on import order, because `mss` quietly makes the process DPI-aware. OSWright now declares per-monitor DPI awareness at import, so everything is physical pixels.
-- **Window capture clamped to zero,** cropping or losing windows on monitors with negative coordinates. Now clipped to the real virtual-desktop bounds.
-
-**Fixed — reliability**
-
-- **OCR cache could serve stale results.** The key was a 16×16 perceptual hash, which is designed to collide on similar images; a genuinely changed screen could hash to its previous value. Now an exact content digest.
-- **`json.dumps` crashed on successful image matches** — template match coordinates were `numpy.int64`.
-- **Solid-colour templates matched everywhere** at confidence 1.0, because `TM_CCOEFF_NORMED` degenerates for a zero-variance template.
-- **`wait_for_change` missed colour-only changes** — it compared luminance, so red and green of equal brightness read as identical.
-- **Emoji and other non-BMP characters were corrupted** by `type_text` on Windows (truncated into a 16-bit field instead of sent as a UTF-16 surrogate pair).
-- **Clipboard writes on macOS always failed** with `TypeError` (`Popen` has no `timeout` parameter). Windows clipboard writes now check every step and no longer leak memory on failure. Added Wayland (`wl-clipboard`) support.
-- **64-bit ctypes bugs.** Window and process handles were truncated to 32 bits by ctypes' default `int` return type.
-- **Stuck modifiers and mouse buttons.** An exception mid-`press()` or mid-`drag()` left Ctrl/Alt or a mouse button held down, corrupting every later input.
-- **`mss` is not thread-safe**, but the MCP server runs tools in a thread pool and shared one instance. Now one per thread.
-- **Concurrent MCP requests could interleave** keystrokes and clicks mid-action. Actions now hold a lock.
-- **`--timeout` did nothing.** Every tool hardcoded 10s.
-- **`--host`/`--port` did nothing.** They were applied after `FastMCP` had already read its settings, so the server always bound to `:8000`.
-- **`--log-level` was overridden by the environment** even when passed explicitly.
-- **Only the first `--ocr-languages` value was used** by the Windows backend.
-- Fatal locator errors (missing template file, no search criteria) burned the full timeout before reporting a misleading "timeout".
-- `wait_for(state="hidden")` reported success on any transient capture error.
-- Text assertions checked once instead of polling, and ignored the configured timeout.
-- `get_ui_tree` hid controls that expose only an `automation_id`.
-- Linux `wmctrl` parsing dropped the first word of every window title.
-
-**Fixed — safety**
-
-- **`launch_app` rejected every Windows path.** The v0.3.0 injection fix blocklisted `\`, so `C:\Windows\notepad.exe` was refused. The blocklist is gone — with `shell=False` nothing interprets shell syntax — and replaced with correct argv parsing plus an explicit `args` list.
-- **No authentication on remote binds.** The server now refuses non-loopback addresses unless `--allow-remote` is passed, and warns loudly when it is.
-- `close_window` is now annotated destructive; screenshot tools refuse to overwrite an existing file.
-- Partial region bounds were silently ignored, capturing the whole screen instead of the requested area.
-
-**Added**
-
-- `--snapshot-max-width` to downscale the auto-snapshot returned after every action, cutting token cost.
-- CI: lint plus tests on Windows (3.10–3.13) and Linux, and a packaging check.
-- Test suite grew from 22 to 91, and `pytest tests/` now actually works — the e2e tests were previously a plain script that pytest collected and errored on.
-
-**Performance**
-
-- Server startup no longer imports EasyOCR (and therefore torch) just to check whether it exists.
-- One OCR engine and one screen capture are shared across `Screen` objects instead of built per `screen()` call, and both are created lazily.
-- Image locators no longer require an OCR backend at all.
-
-### v0.3.0
-
-- **Accessibility tree support** — Windows UI Automation backend for deterministic element finding by role and name. 100% accurate, instant, no model needed. Tools: `get_ui_tree`, `click_ui_element`, `fill_ui_element`.
-- **OCR result caching** — Perceptual image hashing avoids redundant OCR scans when screen hasn't changed. Automatic cache hits speed up repeated queries.
-- **Screenshot diffing** — `wait_for_change` tool detects when the screen visually changes after an action. `images_differ` and `get_diff_region` utilities.
-- **get_active_window** — New tool to identify which window is currently focused.
-- **Test suite** — 22 automated tests covering cache, diff, clipboard, window management, OCR backend selection.
-- **Security fix** — `launch_app` now rejects shell metacharacters and uses `shell=False`.
-- **35+ MCP tools** total. Improved MCP instructions for better agent guidance.
-
-### v0.2.0
-
-- **Windows OCR backend** — Built-in Windows.Media.Ocr, instant recognition, zero model download, ~10x faster than EasyOCR. Auto-selected on Windows.
-- **Window management** — `list_windows`, `focus_window`, `close_window`, `minimize_window`, `screenshot_window`. Cross-platform (Win32, wmctrl, osascript).
-- **Clipboard tools** — `get_clipboard`, `set_clipboard`. Cross-platform (Win32, pbcopy/pbpaste, xclip/xsel).
-- **App launcher** — `launch_app` with optional `wait_text` to wait for the app to load.
-- **OCR info tool** — `get_ocr_info` to see which backend is active and available.
-- **30+ MCP tools** total (up from 20 in v0.1.0).
-- **Pluggable OCR architecture** — detect.py refactored to auto-select the best available backend.
-
-### v0.1.0
-
-- Initial release.
-- Cross-platform input: Windows (Win32 API), Linux/macOS (pynput).
-- OCR text detection via EasyOCR, image template matching via OpenCV.
-- MCP server with 20+ tools — screenshot, click, type, scroll, drag, find text, fill forms.
-- Playwright-style Python library API with auto-waiting locators and assertions.
-- CLI arguments: `--port`, `--host`, `--transport`, `--ocr-languages`, `--timeout`, `--log-level`.
-- SSE transport for remote/multi-client access.
-- GitHub Actions workflow for PyPI trusted publishing.
+Or point any MCP client at `uvx oswright`.
+
+Everything above is reproducible from
+[`benchmarks/`](https://github.com/Ask-812/oswright/tree/master/benchmarks). The
+reasoning, including thirty things I got wrong, is in
+[`docs/ENGINEERING_LOG.md`](https://github.com/Ask-812/oswright/blob/master/docs/ENGINEERING_LOG.md).
