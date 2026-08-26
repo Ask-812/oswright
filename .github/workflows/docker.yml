@@ -35,7 +35,9 @@ jobs:
         run: docker build -t oswright:ci .
 
       - name: Report image size
-        run: docker image inspect oswright:ci --format '{{.Size}}' | awk '{printf "image: %.0f MB\n", $1/1048576}'
+        run: |
+          BYTES=$(docker image inspect oswright:ci --format '{{.Size}}')
+          echo "image size: $((BYTES / 1048576)) MB"
 
       - uses: actions/setup-python@v5
         with:
