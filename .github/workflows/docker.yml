@@ -1,0 +1,72 @@
+name: Container introspection
+
+# OSWright drives a Windows desktop, so a Linux container cannot automate
+# anything. It can still start the server and answer introspection, which is
+# what directory listings and protocol conformance checks require -- so the
+# claim being tested here is exactly that and nothing more.
+#
+# Worth verifying in CI rather than by hand: the image is what a directory
+# indexes, and an image that stops starting would break a listing silently.
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - "Dockerfile"
+      - "oswright/**"
+      - "pyproject.toml"
+      - ".github/workflows/docker.yml"
+  pull_request:
+    paths:
+      - "Dockerfile"
+      - "oswright/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  introspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: docker build -t oswright:ci .
+
+      - name: Report image size
+        run: docker image inspect oswright:ci --format '{{.Size}}' | awk '{printf "image: %.0f MB\n", $1/1048576}'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Speak MCP to the container over stdio
+        run: |
+          pip install --quiet "mcp[cli]<2"
+          python - <<'PY'
+          import asyncio
+          from mcp import ClientSession, StdioServerParameters
+          from mcp.client.stdio import stdio_client
+
+          async def main():
+              # -i keeps stdin open, which is how stdio transport works at all.
+              params = StdioServerParameters(
+                  command="docker",
+                  args=["run", "--rm", "-i", "oswright:ci"],
+              )
+              async with stdio_client(params) as (read, write):
+                  async with ClientSession(read, write) as session:
+                      info = await session.initialize()
+                      tools = (await session.list_tools()).tools
+                      print(f"server: {info.serverInfo.name} {info.serverInfo.version}")
+                      print(f"tools: {len(tools)}")
+                      for t in sorted(t.name for t in tools)[:5]:
+                          print("  ", t)
+                      assert tools, "server exposed no tools"
+                      # Every tool needs a schema, or a client cannot call it.
+                      missing = [t.name for t in tools if not t.inputSchema]
+                      assert not missing, f"tools without an input schema: {missing}"
+
+          asyncio.run(main())
+          PY
