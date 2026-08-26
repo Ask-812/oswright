@@ -983,6 +983,70 @@ build the apparatus that measures your competitor, every bug in it defaults to
 their disadvantage.** That asymmetry does not announce itself; the only defence
 is deciding in advance what a fair run looks like.
 
+### 2.18 Two findings from building a demo
+
+A demo of a desktop agent clicking things is worthless: it looks identical to
+every automation tool built since 2015, and it shows a capability everyone has.
+What distinguishes this project is invisible on screen, so the demo had to put
+the number next to the work — eight fields transcribed from an invoice into an
+expense form, with a live token counter beside it. **25,122 tokens against
+3,404** for identical, application-verified results.
+
+Building it turned up two things worth more than the animation.
+
+**Chrome stops painting when it decides it is not visible.** The fixture looked
+broken: OCR read the tab title and the address bar and *nothing at all* from the
+page, while the window reported the right title and the right size. The client
+area was genuinely blank — Chrome's native occlusion detection had concluded the
+window was hidden and stopped rendering. That is indistinguishable from a
+perception failure, and I spent real time treating it as one.
+
+Three flags fix it, and anything that drives or records a browser it does not
+have in the foreground needs them:
+
+```
+--disable-features=CalculateNativeWinOcclusion
+--disable-backgrounding-occluded-windows
+--disable-renderer-backgrounding
+```
+
+This is worth suspecting whenever a browser looks blank to a capture: the bug is
+not in the reader.
+
+**Windows OCR drops text depending on what surrounds it.** One label, `Supplier`,
+was never found — 3 runs out of 3, while the seven labels below it in the same
+font, size and colour were read every time. It was plainly on screen.
+
+Isolating it:
+
+| what was OCR'd | `Supplier` |
+|---|---|
+| whole 1920×1080 frame | missed |
+| 660×660 crop of the form, native resolution | missed |
+| 310×40 crop of that one row | **read, twice** |
+
+The same pixels. Not resolution — the crop was already native — but the
+recogniser's *layout analysis*, which groups a page into blocks and lines before
+recognising anything, and drops this word when there is more page around it.
+This is the same phenomenon as the 90.9% full-frame-versus-crop agreement in
+§2.3, but here it has a task-level consequence: the field is never filled.
+
+**And there is no fallback.** The cascade tries the accessibility tree next, and
+UIA returns **zero** elements for this page — not just for `Supplier`, but for
+`Reference` and `Approver` too, which OCR reads fine. Chrome's content is opaque
+to oswright's UIA rung, so text that the recogniser drops is unreachable by any
+rung at all.
+
+**What I did not do about it.** Tiling the frame recovers the word — at 480×240
+tiles. But 480×120 misses it, and so do 640×360, 960×540 and 640×180. A fix that
+works at one tile size and fails at both larger and smaller ones is not a fix,
+it is a coincidence I would be shipping. §2.11 already records me trying to tune
+my way out of a structural limit; doing it again with a magic tile size would be
+the same mistake with a different constant. The finding is documented, the demo
+uses a label the recogniser reads, and the limitation stands until there is a
+principled answer — most likely a real accessibility path into browser content,
+which Windows-MCP has and this does not (§2.17).
+
 ---
 
 ## Part 3 — Results
@@ -1109,6 +1173,14 @@ Worth knowing, because these are the questions an interviewer will ask.
     two-step task looked like a real oswright weakness; at five repeats it was
     5/5. The genuine weakness was elsewhere and smaller — 19/20 overall — and I
     would have documented the wrong one (§2.17).
+29. **Spent real time treating a blank browser as a perception failure.** Chrome
+    had stopped painting because it decided its window was occluded; the reader
+    was working perfectly (§2.18). When a capture looks empty, suspect the thing
+    being captured before the thing capturing it.
+30. **Nearly shipped a magic number as a fix.** Tiled OCR at 480×240 recovers
+    text that full-frame OCR drops — but 480×120 and 640×360 do not, so the tile
+    size was a coincidence, not a mechanism (§2.18). §2.11 records me making
+    this exact mistake once already, which is the only reason I recognised it.
 
 Approaches investigated and rejected on evidence:
 

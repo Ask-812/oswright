@@ -1,6 +1,31 @@
 # OSWright
 
-A Model Context Protocol (MCP) server that provides **OS-level desktop automation** using OCR and image matching. This server enables LLMs to interact with any desktop application -- click buttons, type text, read screens, and fill forms -- just like [Playwright MCP](https://github.com/microsoft/playwright-mcp) does for browsers.
+**Desktop automation for AI agents, without paying for a screenshot every step.**
+
+An MCP server that lets an LLM drive real desktop applications — the desktop
+equivalent of [Playwright MCP](https://github.com/microsoft/playwright-mcp). It
+keeps a model of the screen between actions and re-reads only the parts that
+changed, so the same work costs an order of magnitude fewer tokens.
+
+![OSWright transcribing an invoice into an expense form](docs/demo.gif)
+
+Eight fields read off an invoice and typed into an expense form, verified by the
+application itself. Same task, same result, **7.4× less context** than returning
+a screenshot after every action. Every number on screen is measured during the
+run — regenerate the whole thing with `python benchmarks/record_demo.py`.
+
+### Why this exists
+
+Most GUI agents re-perceive the entire screen on every step: screenshot, OCR,
+hand the model an image, repeat. Measured on a live desktop, **the median
+observation changes 0.012% of the screen's pixels**. Re-reading everything does
+far more work than the change warrants, and charges ~2,800 image tokens whether
+anything happened or not.
+
+OSWright asks the compositor what changed, rescans only that, and answers
+element lookups from the cheapest source that can. The claims below are measured
+on this machine and reproducible from [`benchmarks/`](benchmarks/) — including
+the ones that did not come out in its favour.
 
 ### Key Features
 
@@ -21,7 +46,7 @@ A Model Context Protocol (MCP) server that provides **OS-level desktop automatio
 - **Adaptive waiting.** Waits for the screen to actually settle rather than sleeping a fixed 300 ms — 11.9 s saved over a 50-step task.
 - **Resolution cascade.** Element lookups stop at the cheapest method that works; repeat lookups cost ~0.05 ms.
 - **DPI-correct.** Coordinates are physical pixels everywhere, so clicks land correctly on scaled displays.
-- **Test suite.** 213 automated tests; the desktop-driving ones skip themselves when no display is available.
+- **Test suite.** 237 automated tests; the desktop-driving ones skip themselves when no display is available.
 
 ### Requirements
 

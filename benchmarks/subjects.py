@@ -341,6 +341,10 @@ class Chrome(Subject):
     def available(self) -> bool:
         return _first_existing(CHROME_CANDIDATES) is not None
 
+    def page_url(self) -> str:
+        """Where the browser should be pointed. Overridable by subclasses."""
+        return "file:///" + self._page.replace(os.sep, "/")
+
     def launch(self):
         self._profile = tempfile.mkdtemp(prefix="oswright_chrome_")
         handle, self._page = tempfile.mkstemp(suffix=".html", prefix="oswright_page_")
@@ -354,11 +358,23 @@ class Chrome(Subject):
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-extensions",
+            # Chrome decides for itself whether its window is visible, and when
+            # it concludes the window is occluded it stops painting -- leaving a
+            # blank white client area that still reports the right title. That
+            # is indistinguishable from a perception failure, and it is what
+            # made this fixture look broken: OCR read the tab title and the
+            # address bar and nothing at all from the page.
+            #
+            # Anything driving or recording a browser it does not have in the
+            # foreground needs these three.
+            "--disable-features=CalculateNativeWinOcclusion",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
             "--new-window",
-            f"file:///{self._page.replace(os.sep, '/')}",
+            self.page_url(),
         ], shell=False)
         return wait_for_window(
-            before, lambda t: "oswright bench" in t, timeout=30.0, settle=1.5
+            before, lambda t: self.WINDOW_HINT in t, timeout=30.0, settle=1.5
         )
 
     def ground_truth(self, window):
