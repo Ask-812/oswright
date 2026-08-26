@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: How it works, and why
+    url: https://github.com/Ask-812/oswright/blob/master/docs/ENGINEERING_LOG.md
+    about: Design decisions, measurements, and the things that went wrong.
+  - name: Reproduce the numbers
+    url: https://github.com/Ask-812/oswright/tree/master/benchmarks
+    about: Every performance claim in the README is runnable.
