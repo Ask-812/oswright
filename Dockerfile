@@ -19,22 +19,27 @@
 
 FROM python:3.12-slim
 
-# opencv needs libGL and libglib even when it is only imported.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 \
-    && rm -rf /var/lib/apt/lists/*
-
 WORKDIR /app
 COPY . /app
 
-RUN pip install --no-cache-dir --no-deps . \
+# opencv needs libGL and libglib even when only imported. pynput is a hard
+# requirement of oswright.input on Linux, and it pulls evdev, which has no
+# wheel and compiles against kernel headers -- so the toolchain goes in, the
+# install happens, and the toolchain comes back out in the same layer.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libgl1 libglib2.0-0 \
+        gcc python3-dev linux-libc-dev \
+    && pip install --no-cache-dir --no-deps . \
     && pip install --no-cache-dir \
         "mcp[cli]>=1.0,<2" \
         mss \
         Pillow \
         opencv-python-headless \
         numpy \
-        pynput
+        pynput \
+    && apt-get purge -y --auto-remove gcc python3-dev linux-libc-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 # Fail the build rather than ship an image that cannot serve, which is the whole
 # reason this file exists.
