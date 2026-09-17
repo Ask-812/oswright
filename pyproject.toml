@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "oswright"
-# Single source of truth is oswright/__init__.py, read statically by setuptools.
+# Single source of truth is oswright/_version.py, read statically by setuptools.
 dynamic = ["version"]
 description = "Playwright-like automation framework for the operating system"
 readme = "README.md"

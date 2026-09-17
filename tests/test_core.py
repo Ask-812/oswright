@@ -3,6 +3,8 @@ Tests for OSWright core functionality.
 Run with: python -m pytest tests/ -v
 """
 
+import pathlib
+
 import pytest
 from PIL import Image
 
@@ -525,6 +527,100 @@ class TestServerIdentity:
         from oswright.mcp_server import mcp
 
         assert mcp._mcp_server.name == "OSWright"
+
+
+class TestVersionConsumers:
+    """
+    Every file that restates the version, checked from one place.
+
+    The version used to be a literal in `__init__.py`. Moving it into
+    `_version.py` broke three consumers that read it *statically* rather than
+    importing it: setuptools' `attr =`, and the release workflow's tag check,
+    which greps for a literal assignment and got `None`.
+
+    Two of those were caught by a build and a failed release. The lesson is not
+    "remember to grep" -- it is that a value duplicated across files needs a
+    test that fails locally, in seconds, rather than a guard that only speaks
+    up during a release nobody can re-run.
+    """
+
+    def _repo_root(self) -> pathlib.Path:
+        return pathlib.Path(__file__).resolve().parent.parent
+
+    def test_server_json_matches_the_package(self):
+        """
+        The MCP registry entry is published from `server.json`. If it lags the
+        package, the registry advertises a version and `uvx oswright` installs
+        a different one.
+        """
+        import json
+
+        import oswright
+
+        path = self._repo_root() / "server.json"
+        if not path.exists():
+            pytest.skip("server.json only exists in a source checkout")
+
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        assert manifest["version"] == oswright.__version__
+        for package in manifest["packages"]:
+            assert package["version"] == oswright.__version__
+
+    def test_setuptools_can_still_read_the_version_statically(self):
+        """
+        setuptools resolves `version = {attr = ...}` by parsing the AST for a
+        literal, without importing. A version that is only computable at
+        runtime makes `python -m build` fail outright.
+        """
+        import ast
+        import re
+
+        pyproject = (self._repo_root() / "pyproject.toml").read_text(encoding="utf-8")
+        match = re.search(r'version\s*=\s*\{attr\s*=\s*"([^"]+)"\}', pyproject)
+        if match is None:
+            pytest.skip("pyproject.toml does not declare a dynamic version")
+
+        module_path, attribute = match.group(1).rsplit(".", 1)
+        source_file = self._repo_root() / pathlib.Path(*module_path.split(".")).with_suffix(".py")
+        assert source_file.exists(), f"{module_path} does not exist"
+
+        tree = ast.parse(source_file.read_text(encoding="utf-8"))
+        literals = [
+            node.value.value
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            for target in node.targets
+            if isinstance(target, ast.Name) and target.id == attribute
+            if isinstance(node.value, ast.Constant)
+        ]
+        assert literals, f"{attribute} in {module_path} is not a literal setuptools can read"
+
+        import oswright
+
+        assert literals[0] == oswright.__version__
+
+    def test_the_release_guard_can_find_the_version(self):
+        """
+        Mirrors the regex in `.github/workflows/publish.yml`, which compares
+        the release tag against the package. When the version moved, that
+        regex silently matched nothing and the guard died on `None.group`.
+        """
+        import re
+
+        workflow = self._repo_root() / ".github" / "workflows" / "publish.yml"
+        if not workflow.exists():
+            pytest.skip("workflow only exists in a source checkout")
+
+        target = re.search(r"pathlib\.Path\('([^']+)'\)", workflow.read_text(encoding="utf-8"))
+        assert target is not None, "release guard no longer reads a file path"
+
+        source = (self._repo_root() / target.group(1)).read_text(encoding="utf-8")
+        found = re.search(r'__version__\s*=\s*"([^"]+)"', source)
+        assert found is not None, f"release guard greps {target.group(1)} and finds nothing"
+
+        import oswright
+
+        assert found.group(1) == oswright.__version__
 
 
 class TestOCRWarmUp:

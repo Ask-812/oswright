@@ -97,5 +97,26 @@ jobs:
         with:
           name: dist
           path: dist/
+      # `skip-existing` because this workflow has two triggers, and both can
+      # fire for the same version: a manual dispatch to publish, followed by
+      # the release event for the tag that was just cut.
+      #
+      # That is not a theoretical duplicate. The v0.8.1 release run failed with
+      # a PyPI 400 purely because a dispatch had already uploaded it twenty
+      # minutes earlier. The upload was fine; the red X was noise.
+      #
+      # The cost of that noise was real. It taught me that a failed release run
+      # meant nothing, so when v0.8.2's release run failed for an actual reason
+      # -- a version-check guard reading a file the version had moved out of --
+      # it looked exactly the same from the outside and went unread. An alert
+      # that is usually wrong is worse than no alert, because it is believed
+      # the one time it is right.
+      #
+      # Correctness is not weakened by this: the tag-versus-package check above
+      # is what guarantees the right version is being shipped, and it still
+      # fails loudly. This only stops a second upload of a version already
+      # published from being reported as a failure.
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
