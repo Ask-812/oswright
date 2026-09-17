@@ -40,6 +40,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp import Image as MCPImage
 from mcp.types import ToolAnnotations
 
+from oswright._version import __version__
 from oswright.capture import ScreenCapture
 from oswright.detect import ImageMatcher, OCREngine
 from oswright.input import Keyboard, Mouse
@@ -66,6 +67,12 @@ mcp = FastMCP(
         "After clicking, wait briefly then screenshot to see the result."
     ),
 )
+
+# FastMCP does not accept a server version, and the low-level server it
+# builds defaults to None -- which makes the SDK report its own version as
+# ours. Clients use this to tell releases apart, so it has to be set, and
+# the wrapped server is the only place that holds it.
+mcp._mcp_server.version = __version__
 
 _capture: Optional[ScreenCapture] = None
 _ocr: Optional[OCREngine] = None
@@ -157,14 +164,77 @@ def _get_capture() -> ScreenCapture:
         return _capture
 
 
+#: Where OCR initialisation has got to. Reported by `get_ocr_info` so a client
+#: can tell "still loading" apart from "broken", which a bare timeout cannot.
+#:   not_started -> loading -> ready | failed
+_ocr_state: str = "not_started"
+
+#: The exception from a failed initialisation, kept so every later call reports
+#: the same cause instead of silently retrying a load that cannot work.
+_ocr_error: Optional[BaseException] = None
+
+
 def _get_ocr() -> OCREngine:
-    """Lazy-init OCR engine (heavy first load)."""
-    global _ocr
+    """
+    Return the OCR engine, constructing it if this is the first use.
+
+    Blocking, and on Linux/macOS it is *very* blocking: the EasyOCR backend
+    imports Torch and builds a reader, which takes far longer than the ten
+    seconds an MCP client typically allows a request. When that happened the
+    client cancelled, the stdio transport tore down under the running load, and
+    the whole server disappeared from the session.
+
+    Callers that genuinely need OCR still wait here -- there is nothing else to
+    return -- but `warm_ocr_in_background()` normally gets there first, so the
+    wait has already been paid by the time a tool asks. The lock means
+    concurrent first calls share one construction rather than racing.
+    """
+    global _ocr, _ocr_state, _ocr_error
     with _ocr_lock:
-        if _ocr is None:
-            logger.info("Initializing OCR engine (first use, languages=%s)...", _ocr_languages)
+        if _ocr is not None:
+            return _ocr
+        if _ocr_error is not None:
+            # Rebuilding a backend that has already failed just re-imports a
+            # broken dependency on every call.
+            raise _ocr_error
+        _ocr_state = "loading"
+        logger.info("Initializing OCR engine (languages=%s)...", _ocr_languages)
+        started = time.time()
+        try:
             _ocr = OCREngine(languages=_ocr_languages)
+        except BaseException as e:
+            _ocr_state = "failed"
+            _ocr_error = e
+            logger.warning("OCR engine failed to initialize: %s", e)
+            raise
+        _ocr_state = "ready"
+        logger.info("OCR engine ready in %.1fs", time.time() - started)
         return _ocr
+
+
+def warm_ocr_in_background() -> None:
+    """
+    Start building the OCR engine without holding up anything else.
+
+    Called once from `main()`, after the language arguments are known. MCP
+    initialisation and every non-OCR tool stay responsive while the model
+    loads, and by the time a client asks for something that needs OCR the cost
+    has usually already been paid off the request path.
+
+    Daemon, so a client disconnecting mid-load does not keep the process alive.
+    Failures are recorded on the shared state rather than raised into a thread
+    nobody is watching.
+    """
+    def _warm():
+        try:
+            _get_ocr()
+        except BaseException:
+            # Already recorded in _ocr_state/_ocr_error by _get_ocr; a traceback
+            # from an unwatched thread would only be noise on stderr, which for
+            # a stdio server shares a channel with real diagnostics.
+            logger.debug("Background OCR warm-up failed", exc_info=True)
+
+    threading.Thread(target=_warm, name="oswright-ocr-warmup", daemon=True).start()
 
 
 def _timeout(value: Optional[float]) -> float:
@@ -1473,14 +1543,23 @@ def get_ocr_info() -> str:
     Get information about the active OCR backend and available backends.
     Useful for debugging OCR issues.
     """
-    from oswright.detect import _OCR_BACKENDS
+    from oswright.detect import _OCR_BACKEND, _OCR_BACKENDS
 
-    ocr = _get_ocr()
-    return json.dumps({
-        "active_backend": ocr.backend_name,
+    # Deliberately does not call _get_ocr(). Asking a diagnostic question
+    # should never trigger the expensive thing being diagnosed: on Linux and
+    # macOS that meant a "which backend am I using?" call imported Torch and
+    # blocked for longer than the client's request deadline.
+    payload = {
+        "selected_backend": _OCR_BACKEND,
         "available_backends": _OCR_BACKENDS,
-        "languages": ocr._languages,
-    })
+        "languages": _ocr_languages,
+        "state": _ocr_state,
+    }
+    if _ocr is not None:
+        payload["active_backend"] = _ocr.backend_name
+    if _ocr_error is not None:
+        payload["error"] = f"{type(_ocr_error).__name__}: {_ocr_error}"
+    return json.dumps(payload)
 
 
 # =========================================================================
@@ -2030,6 +2109,12 @@ def main():
         mcp.settings.host = host
         if args.port:
             mcp.settings.port = args.port
+
+    # Build the OCR engine off the request path. On Windows this is nearly
+    # free; on Linux and macOS it imports Torch and costs tens of seconds, and
+    # paying that inside the first tool call is what made clients time out and
+    # drop the server entirely.
+    warm_ocr_in_background()
 
     logger.info(
         "Starting OSWright MCP server (transport=%s, ocr=%s, timeout=%.1fs%s)",

@@ -11,12 +11,13 @@ Usage:
         screen.screenshot("output.png")
 """
 
+from oswright._version import __version__
 from oswright.core import OSWright
 from oswright.locator import ElementNotFoundError, Locator, OSWrightError, TimeoutError
 from oswright.screen import Screen
 
-__version__ = "0.8.1"
 __all__ = [
+    "__version__",
     "OSWright",
     "Screen",
     "Locator",

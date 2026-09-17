@@ -180,7 +180,29 @@ class OCREngine:
     - EasyOCR: cross-platform, slower, downloads models on first use
     """
 
-    # Max width for OCR processing (larger images are downsampled to save memory)
+    # How wide an image may be before it is downsampled for OCR.
+    #
+    # This is not a memory knob, whatever the original comment said -- it
+    # decides whether small text survives at all, and the two backends differ
+    # sharply. Measured on a 1920x1080 frame of 12-14 px monospace text:
+    #
+    #   backend       1280 (downscaled)   1920 (native)
+    #   winocr        5/5                 5/5
+    #   easyocr       0/5                 5/5
+    #
+    # Windows OCR is indifferent. EasyOCR fails completely: a 12 px glyph
+    # shrinks to 8 px and stops being recognisable. Since EasyOCR is the
+    # default backend on Linux and macOS, the old shared 1280 cap meant small
+    # text was effectively invisible there -- reported from a 1680x1050 Mac,
+    # where a plainly visible `Current` produced no candidate at all.
+    DEFAULT_MAX_OCR_WIDTH = {
+        "winocr": 1280,
+        # 0 means "do not downsample", which is what EasyOCR needs.
+        "easyocr": 0,
+    }
+
+    #: Fallback for an unknown backend, and the value `OSWRIGHT_OCR_MAX_WIDTH`
+    #: overrides. 0 disables downsampling entirely.
     MAX_OCR_WIDTH = 1280
 
     def __init__(self, languages: list[str] = None, backend: Optional[str] = None):
@@ -203,6 +225,21 @@ class OCREngine:
                 f"Unknown OCR backend: {self._backend}. Available: {_OCR_BACKENDS}"
             )
 
+        # The right cap depends on which backend was selected above, and an
+        # explicit setting beats both. 0 anywhere means native resolution.
+        override = os.environ.get("OSWRIGHT_OCR_MAX_WIDTH")
+        if override is not None and override.strip():
+            try:
+                self.MAX_OCR_WIDTH = max(0, int(override))
+            except ValueError:
+                logger.warning(
+                    "Ignoring OSWRIGHT_OCR_MAX_WIDTH=%r: not an integer", override
+                )
+        else:
+            self.MAX_OCR_WIDTH = self.DEFAULT_MAX_OCR_WIDTH.get(
+                self._backend, OCREngine.MAX_OCR_WIDTH
+            )
+
         # Initialize OCR result cache
         from oswright.cache import ScreenCache
         self._cache = ScreenCache()
@@ -219,7 +256,7 @@ class OCREngine:
         Scale factor is used to map coordinates back to original size.
         """
         w, h = image.size
-        if w <= self.MAX_OCR_WIDTH:
+        if not self.MAX_OCR_WIDTH or w <= self.MAX_OCR_WIDTH:
             return image, 1.0
 
         scale = self.MAX_OCR_WIDTH / w

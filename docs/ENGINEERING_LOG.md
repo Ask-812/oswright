@@ -1049,6 +1049,69 @@ which Windows-MCP has and this does not (§2.17).
 
 ---
 
+
+### 2.19 Three bug reports, and what measuring them changed
+
+The first external bug reports arrived against v0.8.1. All three were real, and
+two of them I had evidence for already and had not noticed.
+
+**The server was lying about its own version.** `initialize` reported `1.29.1`
+-- the MCP SDK's version, not OSWright's. `FastMCP` takes no version argument
+and the low-level server it wraps defaults to `None`, at which point the SDK
+reports itself. My own container CI had printed `server: OSWright 1.29.1` in
+the logs and I read straight past it. The version now lives in a
+dependency-free `oswright/_version.py` so the package and the server cannot
+drift, and a protocol-level test asserts what goes over the wire.
+
+Worth noting: the reporter's suggested fix, `FastMCP(version=__version__)`,
+does not work -- that parameter does not exist. The diagnosis was right and the
+remedy had to be found in the wrapped server.
+
+**Cold OCR start exceeded every client's patience.** On Linux and macOS the
+backend is EasyOCR, which imports Torch. Building it inside the first tool call
+meant the client hit its ~10 s deadline, cancelled, and the stdio transport was
+torn down mid-load -- taking every OSWright tool out of the session until the
+server restarted.
+
+I had never measured this, because Windows OCR is nearly free and Windows is
+what I develop on. Measured here on demand: **62.1 seconds.** Six times a
+typical client timeout. The engine is now built by a daemon thread started at
+startup, with explicit `not_started/loading/ready/failed` state, and
+`get_ocr_info()` no longer calls `_get_ocr()` -- asking a diagnostic question
+should never trigger the expensive thing being diagnosed.
+
+**The downscale cap was not a memory knob.** `MAX_OCR_WIDTH = 1280` shrank
+every frame wider than that before OCR, which on a 1680 px Mac display turned
+12 px glyphs into 9 px ones. The reporter said plainly visible text produced no
+candidate at all.
+
+This one deserved a measurement rather than agreement, so it got one -- a
+1920x1080 frame of monospace text at known sizes, both backends, both widths:
+
+| backend | 1280 (downscaled) | 1920 (native) |
+|---|---|---|
+| Windows OCR | 5/5 | 5/5 |
+| EasyOCR | **0/5** | 5/5 |
+
+Windows OCR is indifferent. EasyOCR fails *completely*. So the single shared
+cap was silently correct on the platform I tested and catastrophic on the two I
+did not. It is now per-backend -- 1280 for Windows OCR, native for EasyOCR --
+and overridable with `OSWRIGHT_OCR_MAX_WIDTH`.
+
+**What the three have in common** is that each was invisible from a Windows
+development machine. Windows OCR is fast, so cold start never hurt; Windows OCR
+tolerates downscaling, so the cap never hurt; and I read my own server's wrong
+version in my own CI output without registering it. A benchmark suite that only
+ever runs where the author sits will confirm whatever the author already
+believes.
+
+I did not implement the tiling that two of the reports suggest. Section 2.18
+records tiled OCR recovering text at 480x240 and failing at 480x120, 640x180,
+640x360 and 960x540, which makes the tile size a coincidence rather than a
+mechanism. Fixing the downscale removes the reason to reach for tiling here.
+
+---
+
 ## Part 3 — Results
 
 Measured over a 14-step agent loop at 1920×1080:

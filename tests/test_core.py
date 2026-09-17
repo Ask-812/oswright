@@ -487,3 +487,227 @@ class TestVersion:
         assert OSWright is not None
         assert Screen is not None
         assert Locator is not None
+
+
+class TestServerIdentity:
+    """
+    What the server calls itself over the wire.
+
+    FastMCP takes no version argument and the low-level server it wraps
+    defaults to None, at which point the SDK reports *its own* version as ours.
+    v0.8.1 therefore announced itself as "1.29.1", the MCP SDK version, so a
+    client had no way to tell which OSWright it was talking to.
+    """
+
+    def test_reports_the_oswright_version_not_the_sdk_version(self):
+        import mcp.server.fastmcp as fastmcp_module
+
+        from oswright._version import __version__
+        from oswright.mcp_server import mcp
+
+        reported = mcp._mcp_server.version
+        assert reported == __version__
+
+        sdk = getattr(fastmcp_module, "__version__", None)
+        if sdk:
+            assert reported != sdk, "still reporting the SDK version"
+
+    def test_version_has_one_source(self):
+        """`oswright.__version__` and the server must not drift apart."""
+        import oswright
+        from oswright._version import __version__
+        from oswright.mcp_server import mcp
+
+        assert oswright.__version__ == __version__
+        assert mcp._mcp_server.version == __version__
+
+    def test_server_is_named_oswright(self):
+        from oswright.mcp_server import mcp
+
+        assert mcp._mcp_server.name == "OSWright"
+
+
+class TestOCRWarmUp:
+    """
+    OCR initialisation must not happen inside a request.
+
+    On Linux and macOS the OCR backend is EasyOCR, which imports Torch and
+    takes far longer than the ~10s an MCP client allows a request. Paying that
+    in the first tool call meant the client cancelled, the stdio transport was
+    torn down mid-load, and every OSWright tool vanished from the session until
+    the server was restarted.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset(self):
+        import oswright.mcp_server as server
+
+        saved = (server._ocr, server._ocr_state, server._ocr_error)
+        server._ocr, server._ocr_state, server._ocr_error = None, "not_started", None
+        yield server
+        server._ocr, server._ocr_state, server._ocr_error = saved
+
+    def test_diagnostics_never_build_an_engine(self, _reset):
+        """`get_ocr_info` used to call `_get_ocr`, so asking cost a full load."""
+        import json
+        import time
+
+        server = _reset
+        started = time.perf_counter()
+        payload = json.loads(server.get_ocr_info())
+        elapsed = time.perf_counter() - started
+
+        assert server._ocr is None, "diagnostics constructed an OCR engine"
+        assert payload["state"] == "not_started"
+        assert elapsed < 1.0, f"diagnostics blocked for {elapsed:.1f}s"
+
+    def test_concurrent_first_calls_share_one_construction(self, _reset, monkeypatch):
+        import threading
+        import time
+
+        server = _reset
+        builds = []
+
+        def slow_engine(languages=None):
+            builds.append(1)
+            time.sleep(0.4)
+            return object()
+
+        monkeypatch.setattr(server, "OCREngine", slow_engine)
+
+        results = []
+        threads = [
+            threading.Thread(target=lambda: results.append(server._get_ocr()))
+            for _ in range(5)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        assert len(builds) == 1, f"built the engine {len(builds)} times"
+        assert len(results) == 5
+        assert all(r is results[0] for r in results), "callers got different engines"
+        assert server._ocr_state == "ready"
+
+    def test_failure_is_sticky_and_reported(self, _reset, monkeypatch):
+        """A backend that cannot load must not be retried on every call."""
+        import json
+
+        server = _reset
+        attempts = []
+
+        def broken_engine(languages=None):
+            attempts.append(1)
+            raise ImportError("no OCR backend available")
+
+        monkeypatch.setattr(server, "OCREngine", broken_engine)
+
+        for _ in range(3):
+            with pytest.raises(ImportError):
+                server._get_ocr()
+
+        assert len(attempts) == 1, "retried a load that had already failed"
+        assert server._ocr_state == "failed"
+
+        payload = json.loads(server.get_ocr_info())
+        assert payload["state"] == "failed"
+        assert "ImportError" in payload["error"]
+
+    def test_warm_up_does_not_block_the_caller(self, _reset, monkeypatch):
+        """Startup must stay fast however slow the backend is."""
+        import time
+
+        server = _reset
+
+        def slow_engine(languages=None):
+            time.sleep(0.6)
+            return object()
+
+        monkeypatch.setattr(server, "OCREngine", slow_engine)
+
+        started = time.perf_counter()
+        server.warm_ocr_in_background()
+        elapsed = time.perf_counter() - started
+        assert elapsed < 0.2, f"warm-up blocked startup for {elapsed:.2f}s"
+
+        deadline = time.time() + 5
+        while server._ocr_state != "ready" and time.time() < deadline:
+            time.sleep(0.05)
+        assert server._ocr_state == "ready", "warm-up never completed"
+
+    def test_a_failing_warm_up_does_not_kill_the_process(self, _reset, monkeypatch):
+        import time
+
+        server = _reset
+
+        def broken_engine(languages=None):
+            raise RuntimeError("model download failed")
+
+        monkeypatch.setattr(server, "OCREngine", broken_engine)
+        server.warm_ocr_in_background()
+
+        deadline = time.time() + 5
+        while server._ocr_state == "not_started" and time.time() < deadline:
+            time.sleep(0.05)
+        assert server._ocr_state == "failed"
+
+
+class TestOCRWidthPolicy:
+    """
+    How wide an image may be before OCR sees a shrunken copy of it.
+
+    The cap used to be a single 1280 for every backend, described as a memory
+    optimisation. It is not: it decides whether small text is legible at all,
+    and the backends disagree. Measured on a 1920x1080 frame of 12-14 px
+    monospace text, Windows OCR found 5/5 either way while EasyOCR found 5/5 at
+    native resolution and 0/5 at 1280 -- a 12 px glyph becomes 8 px and stops
+    being recognisable. EasyOCR is the default on Linux and macOS, so that made
+    small text effectively invisible there.
+    """
+
+    def test_easyocr_defaults_to_native_resolution(self):
+        from oswright.detect import OCREngine
+
+        assert OCREngine.DEFAULT_MAX_OCR_WIDTH["easyocr"] == 0
+
+    def test_windows_ocr_keeps_its_cap(self):
+        from oswright.detect import OCREngine
+
+        assert OCREngine.DEFAULT_MAX_OCR_WIDTH["winocr"] == 1280
+
+    def test_zero_means_no_downsampling(self):
+        from PIL import Image
+
+        from oswright.detect import OCREngine
+
+        engine = OCREngine.__new__(OCREngine)
+        engine.MAX_OCR_WIDTH = 0
+        wide = Image.new("RGB", (3840, 2160), "white")
+        out, scale = engine._preprocess_image(wide)
+        assert out.size == (3840, 2160)
+        assert scale == 1.0
+
+    def test_a_cap_still_downsamples_and_reports_the_scale(self):
+        from PIL import Image
+
+        from oswright.detect import OCREngine
+
+        engine = OCREngine.__new__(OCREngine)
+        engine.MAX_OCR_WIDTH = 1280
+        out, scale = engine._preprocess_image(Image.new("RGB", (1920, 1080), "white"))
+        assert out.width == 1280
+        assert scale == pytest.approx(1280 / 1920)
+
+    def test_environment_overrides_the_backend_default(self, monkeypatch):
+        from oswright.detect import OCREngine
+
+        monkeypatch.setenv("OSWRIGHT_OCR_MAX_WIDTH", "1600")
+        assert OCREngine().MAX_OCR_WIDTH == 1600
+
+    def test_a_bad_override_is_ignored_rather_than_fatal(self, monkeypatch):
+        """A typo in an env var must not stop the server starting."""
+        from oswright.detect import OCREngine
+
+        monkeypatch.setenv("OSWRIGHT_OCR_MAX_WIDTH", "wide-please")
+        assert OCREngine().MAX_OCR_WIDTH == OCREngine.MAX_OCR_WIDTH

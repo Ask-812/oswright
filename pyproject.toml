@@ -87,7 +87,7 @@ oswright = "oswright.mcp_server:main"
 include = ["oswright*"]
 
 [tool.setuptools.dynamic]
-version = {attr = "oswright.__version__"}
+version = {attr = "oswright._version.__version__"}
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

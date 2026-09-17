@@ -7,12 +7,12 @@
     "url": "https://github.com/Ask-812/oswright",
     "source": "github"
   },
-  "version": "0.8.1",
+  "version": "0.8.2",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "oswright",
-      "version": "0.8.1",
+      "version": "0.8.2",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"
