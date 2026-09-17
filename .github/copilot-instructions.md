@@ -7,6 +7,22 @@ only what changed, instead of returning a screenshot after every step.
 Read `CONTRIBUTING.md` first — it has the project's conventions. This file is
 the operational detail an agent needs on top of them.
 
+## Start here, every session
+
+If `HANDOVER.md` exists in the working copy, **read it before doing anything
+else.** It is gitignored local notes — current state, what is half-finished,
+and which weaknesses are known — and it is the only place that carries context
+between sessions. This file describes the project; that one describes where the
+work actually is.
+
+**Before ending a session, update it**: correct *Current state*, adjust *Open
+threads*, add anything newly learned to *Landmines*, and prepend a short dated
+entry to the *Session log*. A conversation that ends without updating it has
+lost everything it learned.
+
+If it does not exist, the repo is being read fresh — `README.md` and
+`docs/ENGINEERING_LOG.md` are the way in.
+
 ## Orientation
 
 | document | what it is for |
