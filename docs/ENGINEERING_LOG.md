@@ -1110,6 +1110,52 @@ records tiled OCR recovering text at 480x240 and failing at 480x120, 640x180,
 640x360 and 960x540, which makes the tile size a coincidence rather than a
 mechanism. Fixing the downscale removes the reason to reach for tiling here.
 
+### 2.20 The alarm I had trained myself to ignore
+
+Shipping the version fix in 2.19 broke the release that carried it.
+
+The version had been a literal in `__init__.py`. I moved it into `_version.py`
+so the package and the MCP server could not drift, which is the right shape.
+But three things read that literal *statically*, without importing it, and all
+three broke at once:
+
+| consumer | how it reads the version | how it failed |
+|---|---|---|
+| setuptools `attr=` | parses the AST for a literal | `python -m build` failed outright |
+| `publish.yml` tag check | greps the file for `__version__ = "..."` | matched nothing, died on `None.group` |
+| `server.json` | restates it by hand | no check at all outside a release |
+
+The first failed loudly and immediately, so I fixed it and assumed I was done.
+The second failed during the release itself — the one moment that cannot be
+re-run, because a `release` event fires once.
+
+The interesting part is why I did not notice for a fortnight.
+
+The previous release, v0.8.1, had *also* failed. Its cause was benign: a manual
+dispatch had already uploaded the package, and PyPI refuses a second upload of
+the same version, so the release-triggered run returned a 400. Nothing was
+wrong. But the run went red, and I learned from it that a red release run meant
+nothing. When v0.8.2 failed for a real reason, it looked identical from the
+outside, and I read it the way I had taught myself to.
+
+**A warning that is usually wrong is worse than no warning, because it gets
+believed exactly once — on the occasion it is right.** The fix is therefore not
+"look harder at red runs". It is to stop generating the false one: the upload
+now tolerates a version that already exists, while the tag-versus-package check
+that actually guards correctness still fails loudly.
+
+The second fix is to stop relying on memory for the duplicates. Three tests now
+assert that `server.json`, the setuptools pointer and the workflow's regex all
+still agree with the package, and each was checked by mutation rather than
+assumed — set `server.json` to a different version, repoint the guard at the
+old file, replace the literal with a computed string. All three fail. The
+middle one reproduces this exact bug in 1.6 seconds, locally, which is where it
+should have been caught.
+
+The general shape, which is the same one as 2.19: a value duplicated across
+files does not need discipline, it needs a test. And a guard that only speaks
+during a release is a guard you cannot debug when it is wrong.
+
 ---
 
 ## Part 3 — Results
@@ -1244,6 +1290,22 @@ Worth knowing, because these are the questions an interviewer will ask.
     text that full-frame OCR drops — but 480×120 and 640×360 do not, so the tile
     size was a coincidence, not a mechanism (§2.18). §2.11 records me making
     this exact mistake once already, which is the only reason I recognised it.
+
+31. **Read the wrong answer in my own output and did not see it.** My container
+    CI printed the server announcing itself as `1.29.1` — the MCP SDK's version,
+    not mine — on every run for a fortnight, and it took a stranger's bug report
+    to make me read the line (§2.19). Output you generate on every run stops
+    being evidence and becomes wallpaper.
+32. **Trained myself to ignore a failing release.** v0.8.1's release run went
+    red for a harmless reason, so when v0.8.2's went red for a real one I read
+    it the same way (§2.20). The cost of a false alarm is not the alarm; it is
+    the true one it discredits. Fixed by removing the false alarm, not by
+    resolving to be more careful.
+33. **Fixed a broken static reference and assumed I had found the only one.**
+    Moving the version literal broke three consumers; the build caught one
+    immediately, and I took that as the whole of it (§2.20). A change that
+    breaks one hidden reader has usually broken every reader of the same kind,
+    and the honest response is to enumerate them rather than wait to be told.
 
 Approaches investigated and rejected on evidence:
 
