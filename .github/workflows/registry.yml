@@ -31,16 +31,26 @@ jobs:
       - uses: actions/checkout@v4
 
       # A registry entry pointing at a version nobody can install is worse than
-      # no entry at all, so check the package really is on PyPI first.
-      - name: Check the version in server.json exists on PyPI
+      # no entry at all, so wait for the package to actually be there.
+      #
+      # Waiting rather than simply checking, because this workflow and the PyPI
+      # one both fire on `release` and race: a plain check ran before the
+      # upload finished and failed every single release. PyPI also needs a
+      # moment to make a new version visible after the upload returns.
+      - name: Wait for the version in server.json to appear on PyPI
         run: |
           VERSION=$(python -c "import json; print(json.load(open('server.json'))['packages'][0]['version'])")
           NAME=$(python -c "import json; print(json.load(open('server.json'))['packages'][0]['identifier'])")
-          echo "checking $NAME==$VERSION"
-          curl -sf "https://pypi.org/pypi/$NAME/$VERSION/json" > /dev/null || {
-            echo "::error::$NAME==$VERSION is not on PyPI"
-            exit 1
-          }
+          echo "waiting for $NAME==$VERSION"
+          for attempt in $(seq 1 30); do
+            if curl -sf "https://pypi.org/pypi/$NAME/$VERSION/json" > /dev/null; then
+              echo "found after $((attempt * 10))s"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::$NAME==$VERSION never appeared on PyPI after 5 minutes"
+          exit 1
 
       - name: Check server.json matches the release
         if: github.event_name == 'release'
