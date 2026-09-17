@@ -11,7 +11,7 @@ the pull request should say by how much, measured, on a named machine -- and if
 it makes something slower somewhere else, it should say that too.
 
 Results that go against the project's own claims are welcome and get written
-down. `docs/ENGINEERING_LOG.md` already records thirty of them.
+down. `docs/ENGINEERING_LOG.md` already records thirty-three of them.
 
 ## Repeats before findings
 
@@ -39,7 +39,7 @@ it agrees with itself.
 ## Running things
 
 ```
-pytest tests/                        # 237 tests; desktop ones skip without a display
+pytest tests/                        # 254 tests; desktop ones skip without a display
 pytest tests/ -m "not e2e"           # unit tests only
 ruff check oswright tests benchmarks # lint
 python benchmarks/bench_tasks.py     # task success, opens real windows

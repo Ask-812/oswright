@@ -53,7 +53,7 @@ the ones that did not come out in its favour.
 - **Adaptive waiting.** Waits for the screen to actually settle rather than sleeping a fixed 300 ms — 11.9 s saved over a 50-step task.
 - **Resolution cascade.** Element lookups stop at the cheapest method that works; repeat lookups cost ~0.05 ms.
 - **DPI-correct.** Coordinates are physical pixels everywhere, so clicks land correctly on scaled displays.
-- **Test suite.** 237 automated tests; the desktop-driving ones skip themselves when no display is available.
+- **Test suite.** 254 automated tests; the desktop-driving ones skip themselves when no display is available.
 
 ### Requirements
 

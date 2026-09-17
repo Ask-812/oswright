@@ -37,3 +37,9 @@ htmlcov/
 
 # Playwright MCP artifacts
 .playwright-mcp/
+
+# Session handover for AI agents working in this folder. Local notes, kept
+# deliberately out of a public repo: it records open weaknesses, unposted
+# drafts and machine-specific detail that belong to the working copy, not to
+# the project. Public agent guidance is .github/copilot-instructions.md.
+HANDOVER.md
