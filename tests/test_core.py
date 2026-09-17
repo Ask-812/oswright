@@ -653,6 +653,13 @@ class TestOCRWarmUp:
         assert server._ocr_state == "failed"
 
 
+def _has_ocr_backend() -> bool:
+    """Whether any OCR engine can actually be constructed here."""
+    from oswright.detect import _OCR_BACKENDS
+
+    return bool(_OCR_BACKENDS)
+
+
 class TestOCRWidthPolicy:
     """
     How wide an image may be before OCR sees a shrunken copy of it.
@@ -699,12 +706,21 @@ class TestOCRWidthPolicy:
         assert out.width == 1280
         assert scale == pytest.approx(1280 / 1920)
 
+    # These two construct a real engine, which needs a backend. CI installs
+    # without one on Linux -- EasyOCR would drag in Torch -- so they skip there
+    # rather than fail for a reason unrelated to what they test.
+    @pytest.mark.skipif(
+        not _has_ocr_backend(), reason="no OCR backend installed"
+    )
     def test_environment_overrides_the_backend_default(self, monkeypatch):
         from oswright.detect import OCREngine
 
         monkeypatch.setenv("OSWRIGHT_OCR_MAX_WIDTH", "1600")
         assert OCREngine().MAX_OCR_WIDTH == 1600
 
+    @pytest.mark.skipif(
+        not _has_ocr_backend(), reason="no OCR backend installed"
+    )
     def test_a_bad_override_is_ignored_rather_than_fatal(self, monkeypatch):
         """A typo in an env var must not stop the server starting."""
         from oswright.detect import OCREngine
